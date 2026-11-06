@@ -21,6 +21,7 @@
 #include <vector>
 #include <string>
 #include <algorithm>
+#include <thread>
 #include <cuda_runtime.h>
 
 #ifdef _WIN32
@@ -41,8 +42,11 @@ typedef uint64_t u64;
 
 #define HD __host__ __device__ __forceinline__
 
+#ifndef GEN_THREADS
+#define GEN_THREADS 256 // k_gen block size
+#endif
 #ifndef GEN_MINB
-#define GEN_MINB 2      // __launch_bounds__ min blocks/SM for k_gen (256 threads): 2 -> <=128 regs
+#define GEN_MINB 2      // __launch_bounds__ min blocks/SM for k_gen: 256 x 2 -> <= 128 regs
 #endif
 
 // ============================================================================
@@ -415,11 +419,14 @@ static void ref_pubkey(const u8 seed[32], u8 pk[32]) {
 // Fixed-base comb table.
 // clamped scalar s = 2^254 + 8*t, t < 2^251. t is split into NWIN windows of W bits,
 // recoded to signed digits in [-2^(W-1), 2^(W-1)] (top window unsigned, [0, 2^top]).
-// Entry [k*HALF + j-1] = j * 8 * 2^(W*k) * G, stored as packed (Y+X, Y-X, 2dXY), 96 bytes.
+// Window 0 is folded into the start point: W0[d + HALF] = 2^254*G + d*8*G for
+// d in [-HALF, HALF], stored affine as packed (X, Y, XY).
+// Window k >= 1: entry [W0N + (k-1)*HALF + j-1] = j * 8 * 2^(W*k) * G, stored as packed
+// (Y+X, Y-X, 2dXY). Every entry is 96 bytes.
 // ============================================================================
 
 struct CombCfg {
-    int w, nwin, half, topbits, entries;
+    int w, nwin, half, topbits, w0n, entries;
 };
 
 static CombCfg comb_cfg(int w) {
@@ -428,12 +435,10 @@ static CombCfg comb_cfg(int w) {
     c.nwin = (251 + w - 1) / w;
     c.half = 1 << (w - 1);
     c.topbits = 251 - w * (c.nwin - 1);
-    int topsz = 1 << c.topbits;
-    c.entries = (c.nwin - 1) * c.half + std::max(topsz, 1);
+    c.w0n = 2 * c.half + 1;
+    c.entries = c.w0n + (c.nwin - 2) * c.half + (1 << c.topbits);
     return c;
 }
-
-__device__ u32 g_start8[3][8];     // 2^254 * G: X, Y, T = XY (affine, Z = 1), canonical words
 
 // Window bases B_k = 8 * 2^(W*k) * G (extended), computed by a ladder.
 __global__ void k_window_bases(ge *bases, int w, int nwin) {
@@ -449,42 +454,44 @@ __global__ void k_window_bases(ge *bases, int w, int nwin) {
     bases[k] = P;
 }
 
-__global__ void k_table(uint4 *table, const ge *bases, int half, int nwin, int first, int count, int entries) {
+__global__ void k_table(uint4 *table, const ge *bases, int half, int nwin, int w0n, int first, int count, int entries) {
     int idx = first + blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= first + count || idx >= entries) return;
-    int k = idx / half, j = idx % half + 1;
-    if (k > nwin - 1) { k = nwin - 1; j = idx - (nwin - 1) * half + 1; }
-    u8 s[4] = { (u8)j, (u8)(j >> 8), (u8)(j >> 16), (u8)(j >> 24) };
+    int k, j;
+    if (idx < w0n) { k = 0; j = idx - half; }
+    else {
+        int r = idx - w0n;
+        k = 1 + r / half; j = r % half + 1;
+        if (k > nwin - 1) { k = nwin - 1; j = r - (nwin - 2) * half + 1; }
+    }
+    int aj = j < 0 ? -j : j;
+    u8 s[4] = { (u8)aj, (u8)(aj >> 8), (u8)(aj >> 16), (u8)(aj >> 24) };
     ge P;
     ge_scalarmult(P, bases[k], s, 32);
-    gf zi, x, y, ypx, ymx, t2d, d2;
+    if (j < 0) { fe_neg(P.X, P.X); fe_neg(P.T, P.T); }
+    if (k == 0) ge_add(P, bases[nwin]);
+    gf zi, x, y, xy, d2;
     fe_invert(zi, P.Z);
     fe_mul(x, P.X, zi);
     fe_mul(y, P.Y, zi);
-    fe_add(ypx, y, x);
-    fe_sub(ymx, y, x);
-    fe_d2(d2);
-    fe_mul(t2d, x, y);
-    fe_mul(t2d, t2d, d2);
+    fe_mul(xy, x, y);
     u32 w[24];
-    fe_pack_words(w, ypx);
-    fe_pack_words(w + 8, ymx);
-    fe_pack_words(w + 16, t2d);
+    if (k == 0) {
+        fe_pack_words(w, x);
+        fe_pack_words(w + 8, y);
+        fe_pack_words(w + 16, xy);
+    } else {
+        gf ypx, ymx, t2d;
+        fe_add(ypx, y, x);
+        fe_sub(ymx, y, x);
+        fe_d2(d2);
+        fe_mul(t2d, xy, d2);
+        fe_pack_words(w, ypx);
+        fe_pack_words(w + 8, ymx);
+        fe_pack_words(w + 16, t2d);
+    }
     uint4 *e = table + (size_t)idx * 6;
     for (int i = 0; i < 6; i++) e[i] = make_uint4(w[4*i], w[4*i+1], w[4*i+2], w[4*i+3]);
-
-    if (idx == 0) {   // start point 2^254 * G, normalised
-        ge S = bases[nwin];
-        gf szi;
-        fe_invert(szi, S.Z);
-        gf sx, sy, st;
-        fe_mul(sx, S.X, szi);
-        fe_mul(sy, S.Y, szi);
-        fe_mul(st, sx, sy);
-        fe_pack_words(g_start8[0], sx);
-        fe_pack_words(g_start8[1], sy);
-        fe_pack_words(g_start8[2], st);
-    }
 }
 
 // ============================================================================
@@ -496,7 +503,7 @@ __global__ void k_table(uint4 *table, const ge *bases, int half, int nwin, int f
 __device__ __forceinline__ void fe8_mul(u32 r[8], const u32 a[8], const u32 b[8]) {
     asm volatile(
         "{\n\t"
-        ".reg .u32 t<17>;\n\t"
+        ".reg .u32 t0, t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13, t14, t15, q1_a0, q1_a1, q1_a2, q1_a3, q1_a4, q1_b0, q1_b1, q1_b2, q1_b3, q1_b4, q1_m0, q1_m1, q1_m2, q1_m3, q1_m4, q1_m5, q1_m6, q1_m7, q1_m8, q1_k, q1_mk;\n\t"
         "mov.u32 t0, 0;\n\t"
         "mov.u32 t1, 0;\n\t"
         "mov.u32 t2, 0;\n\t"
@@ -513,143 +520,186 @@ __device__ __forceinline__ void fe8_mul(u32 r[8], const u32 a[8], const u32 b[8]
         "mov.u32 t13, 0;\n\t"
         "mov.u32 t14, 0;\n\t"
         "mov.u32 t15, 0;\n\t"
-        "mov.u32 t16, 0;\n\t"
         "mad.lo.cc.u32 t0, %8, %16, t0;\n\t"
         "madc.lo.cc.u32 t1, %8, %17, t1;\n\t"
         "madc.lo.cc.u32 t2, %8, %18, t2;\n\t"
         "madc.lo.cc.u32 t3, %8, %19, t3;\n\t"
-        "madc.lo.cc.u32 t4, %8, %20, t4;\n\t"
-        "madc.lo.cc.u32 t5, %8, %21, t5;\n\t"
-        "madc.lo.cc.u32 t6, %8, %22, t6;\n\t"
-        "madc.lo.cc.u32 t7, %8, %23, t7;\n\t"
-        "addc.u32 t8, t8, 0;\n\t"
+        "addc.u32 t4, t4, 0;\n\t"
         "mad.hi.cc.u32 t1, %8, %16, t1;\n\t"
         "madc.hi.cc.u32 t2, %8, %17, t2;\n\t"
         "madc.hi.cc.u32 t3, %8, %18, t3;\n\t"
-        "madc.hi.cc.u32 t4, %8, %19, t4;\n\t"
-        "madc.hi.cc.u32 t5, %8, %20, t5;\n\t"
-        "madc.hi.cc.u32 t6, %8, %21, t6;\n\t"
-        "madc.hi.cc.u32 t7, %8, %22, t7;\n\t"
-        "madc.hi.u32 t8, %8, %23, t8;\n\t"
+        "madc.hi.u32 t4, %8, %19, t4;\n\t"
         "mad.lo.cc.u32 t1, %9, %16, t1;\n\t"
         "madc.lo.cc.u32 t2, %9, %17, t2;\n\t"
         "madc.lo.cc.u32 t3, %9, %18, t3;\n\t"
         "madc.lo.cc.u32 t4, %9, %19, t4;\n\t"
-        "madc.lo.cc.u32 t5, %9, %20, t5;\n\t"
-        "madc.lo.cc.u32 t6, %9, %21, t6;\n\t"
-        "madc.lo.cc.u32 t7, %9, %22, t7;\n\t"
-        "madc.lo.cc.u32 t8, %9, %23, t8;\n\t"
-        "addc.u32 t9, t9, 0;\n\t"
+        "addc.u32 t5, t5, 0;\n\t"
         "mad.hi.cc.u32 t2, %9, %16, t2;\n\t"
         "madc.hi.cc.u32 t3, %9, %17, t3;\n\t"
         "madc.hi.cc.u32 t4, %9, %18, t4;\n\t"
-        "madc.hi.cc.u32 t5, %9, %19, t5;\n\t"
-        "madc.hi.cc.u32 t6, %9, %20, t6;\n\t"
-        "madc.hi.cc.u32 t7, %9, %21, t7;\n\t"
-        "madc.hi.cc.u32 t8, %9, %22, t8;\n\t"
-        "madc.hi.u32 t9, %9, %23, t9;\n\t"
+        "madc.hi.u32 t5, %9, %19, t5;\n\t"
         "mad.lo.cc.u32 t2, %10, %16, t2;\n\t"
         "madc.lo.cc.u32 t3, %10, %17, t3;\n\t"
         "madc.lo.cc.u32 t4, %10, %18, t4;\n\t"
         "madc.lo.cc.u32 t5, %10, %19, t5;\n\t"
-        "madc.lo.cc.u32 t6, %10, %20, t6;\n\t"
-        "madc.lo.cc.u32 t7, %10, %21, t7;\n\t"
-        "madc.lo.cc.u32 t8, %10, %22, t8;\n\t"
-        "madc.lo.cc.u32 t9, %10, %23, t9;\n\t"
-        "addc.u32 t10, t10, 0;\n\t"
+        "addc.u32 t6, t6, 0;\n\t"
         "mad.hi.cc.u32 t3, %10, %16, t3;\n\t"
         "madc.hi.cc.u32 t4, %10, %17, t4;\n\t"
         "madc.hi.cc.u32 t5, %10, %18, t5;\n\t"
-        "madc.hi.cc.u32 t6, %10, %19, t6;\n\t"
-        "madc.hi.cc.u32 t7, %10, %20, t7;\n\t"
-        "madc.hi.cc.u32 t8, %10, %21, t8;\n\t"
-        "madc.hi.cc.u32 t9, %10, %22, t9;\n\t"
-        "madc.hi.u32 t10, %10, %23, t10;\n\t"
+        "madc.hi.u32 t6, %10, %19, t6;\n\t"
         "mad.lo.cc.u32 t3, %11, %16, t3;\n\t"
         "madc.lo.cc.u32 t4, %11, %17, t4;\n\t"
         "madc.lo.cc.u32 t5, %11, %18, t5;\n\t"
         "madc.lo.cc.u32 t6, %11, %19, t6;\n\t"
-        "madc.lo.cc.u32 t7, %11, %20, t7;\n\t"
-        "madc.lo.cc.u32 t8, %11, %21, t8;\n\t"
-        "madc.lo.cc.u32 t9, %11, %22, t9;\n\t"
-        "madc.lo.cc.u32 t10, %11, %23, t10;\n\t"
-        "addc.u32 t11, t11, 0;\n\t"
+        "addc.u32 t7, t7, 0;\n\t"
         "mad.hi.cc.u32 t4, %11, %16, t4;\n\t"
         "madc.hi.cc.u32 t5, %11, %17, t5;\n\t"
         "madc.hi.cc.u32 t6, %11, %18, t6;\n\t"
-        "madc.hi.cc.u32 t7, %11, %19, t7;\n\t"
-        "madc.hi.cc.u32 t8, %11, %20, t8;\n\t"
-        "madc.hi.cc.u32 t9, %11, %21, t9;\n\t"
-        "madc.hi.cc.u32 t10, %11, %22, t10;\n\t"
-        "madc.hi.u32 t11, %11, %23, t11;\n\t"
-        "mad.lo.cc.u32 t4, %12, %16, t4;\n\t"
-        "madc.lo.cc.u32 t5, %12, %17, t5;\n\t"
-        "madc.lo.cc.u32 t6, %12, %18, t6;\n\t"
-        "madc.lo.cc.u32 t7, %12, %19, t7;\n\t"
-        "madc.lo.cc.u32 t8, %12, %20, t8;\n\t"
+        "madc.hi.u32 t7, %11, %19, t7;\n\t"
+        "mad.lo.cc.u32 t8, %12, %20, t8;\n\t"
         "madc.lo.cc.u32 t9, %12, %21, t9;\n\t"
         "madc.lo.cc.u32 t10, %12, %22, t10;\n\t"
         "madc.lo.cc.u32 t11, %12, %23, t11;\n\t"
         "addc.u32 t12, t12, 0;\n\t"
-        "mad.hi.cc.u32 t5, %12, %16, t5;\n\t"
-        "madc.hi.cc.u32 t6, %12, %17, t6;\n\t"
-        "madc.hi.cc.u32 t7, %12, %18, t7;\n\t"
-        "madc.hi.cc.u32 t8, %12, %19, t8;\n\t"
-        "madc.hi.cc.u32 t9, %12, %20, t9;\n\t"
+        "mad.hi.cc.u32 t9, %12, %20, t9;\n\t"
         "madc.hi.cc.u32 t10, %12, %21, t10;\n\t"
         "madc.hi.cc.u32 t11, %12, %22, t11;\n\t"
         "madc.hi.u32 t12, %12, %23, t12;\n\t"
-        "mad.lo.cc.u32 t5, %13, %16, t5;\n\t"
-        "madc.lo.cc.u32 t6, %13, %17, t6;\n\t"
-        "madc.lo.cc.u32 t7, %13, %18, t7;\n\t"
-        "madc.lo.cc.u32 t8, %13, %19, t8;\n\t"
-        "madc.lo.cc.u32 t9, %13, %20, t9;\n\t"
+        "mad.lo.cc.u32 t9, %13, %20, t9;\n\t"
         "madc.lo.cc.u32 t10, %13, %21, t10;\n\t"
         "madc.lo.cc.u32 t11, %13, %22, t11;\n\t"
         "madc.lo.cc.u32 t12, %13, %23, t12;\n\t"
         "addc.u32 t13, t13, 0;\n\t"
-        "mad.hi.cc.u32 t6, %13, %16, t6;\n\t"
-        "madc.hi.cc.u32 t7, %13, %17, t7;\n\t"
-        "madc.hi.cc.u32 t8, %13, %18, t8;\n\t"
-        "madc.hi.cc.u32 t9, %13, %19, t9;\n\t"
-        "madc.hi.cc.u32 t10, %13, %20, t10;\n\t"
+        "mad.hi.cc.u32 t10, %13, %20, t10;\n\t"
         "madc.hi.cc.u32 t11, %13, %21, t11;\n\t"
         "madc.hi.cc.u32 t12, %13, %22, t12;\n\t"
         "madc.hi.u32 t13, %13, %23, t13;\n\t"
-        "mad.lo.cc.u32 t6, %14, %16, t6;\n\t"
-        "madc.lo.cc.u32 t7, %14, %17, t7;\n\t"
-        "madc.lo.cc.u32 t8, %14, %18, t8;\n\t"
-        "madc.lo.cc.u32 t9, %14, %19, t9;\n\t"
-        "madc.lo.cc.u32 t10, %14, %20, t10;\n\t"
+        "mad.lo.cc.u32 t10, %14, %20, t10;\n\t"
         "madc.lo.cc.u32 t11, %14, %21, t11;\n\t"
         "madc.lo.cc.u32 t12, %14, %22, t12;\n\t"
         "madc.lo.cc.u32 t13, %14, %23, t13;\n\t"
         "addc.u32 t14, t14, 0;\n\t"
-        "mad.hi.cc.u32 t7, %14, %16, t7;\n\t"
-        "madc.hi.cc.u32 t8, %14, %17, t8;\n\t"
-        "madc.hi.cc.u32 t9, %14, %18, t9;\n\t"
-        "madc.hi.cc.u32 t10, %14, %19, t10;\n\t"
-        "madc.hi.cc.u32 t11, %14, %20, t11;\n\t"
+        "mad.hi.cc.u32 t11, %14, %20, t11;\n\t"
         "madc.hi.cc.u32 t12, %14, %21, t12;\n\t"
         "madc.hi.cc.u32 t13, %14, %22, t13;\n\t"
         "madc.hi.u32 t14, %14, %23, t14;\n\t"
-        "mad.lo.cc.u32 t7, %15, %16, t7;\n\t"
-        "madc.lo.cc.u32 t8, %15, %17, t8;\n\t"
-        "madc.lo.cc.u32 t9, %15, %18, t9;\n\t"
-        "madc.lo.cc.u32 t10, %15, %19, t10;\n\t"
-        "madc.lo.cc.u32 t11, %15, %20, t11;\n\t"
+        "mad.lo.cc.u32 t11, %15, %20, t11;\n\t"
         "madc.lo.cc.u32 t12, %15, %21, t12;\n\t"
         "madc.lo.cc.u32 t13, %15, %22, t13;\n\t"
         "madc.lo.cc.u32 t14, %15, %23, t14;\n\t"
         "addc.u32 t15, t15, 0;\n\t"
-        "mad.hi.cc.u32 t8, %15, %16, t8;\n\t"
-        "madc.hi.cc.u32 t9, %15, %17, t9;\n\t"
-        "madc.hi.cc.u32 t10, %15, %18, t10;\n\t"
-        "madc.hi.cc.u32 t11, %15, %19, t11;\n\t"
-        "madc.hi.cc.u32 t12, %15, %20, t12;\n\t"
+        "mad.hi.cc.u32 t12, %15, %20, t12;\n\t"
         "madc.hi.cc.u32 t13, %15, %21, t13;\n\t"
         "madc.hi.cc.u32 t14, %15, %22, t14;\n\t"
         "madc.hi.u32 t15, %15, %23, t15;\n\t"
+        "mov.u32 q1_m0, 0;\n\t"
+        "mov.u32 q1_m1, 0;\n\t"
+        "mov.u32 q1_m2, 0;\n\t"
+        "mov.u32 q1_m3, 0;\n\t"
+        "mov.u32 q1_m4, 0;\n\t"
+        "mov.u32 q1_m5, 0;\n\t"
+        "mov.u32 q1_m6, 0;\n\t"
+        "mov.u32 q1_m7, 0;\n\t"
+        "mov.u32 q1_m8, 0;\n\t"
+        "add.cc.u32 q1_a0, %8, %12;\n\t"
+        "addc.cc.u32 q1_a1, %9, %13;\n\t"
+        "addc.cc.u32 q1_a2, %10, %14;\n\t"
+        "addc.cc.u32 q1_a3, %11, %15;\n\t"
+        "addc.u32 q1_a4, 0, 0;\n\t"
+        "add.cc.u32 q1_b0, %16, %20;\n\t"
+        "addc.cc.u32 q1_b1, %17, %21;\n\t"
+        "addc.cc.u32 q1_b2, %18, %22;\n\t"
+        "addc.cc.u32 q1_b3, %19, %23;\n\t"
+        "addc.u32 q1_b4, 0, 0;\n\t"
+        "mad.lo.cc.u32 q1_m0, q1_a0, q1_b0, q1_m0;\n\t"
+        "madc.lo.cc.u32 q1_m1, q1_a0, q1_b1, q1_m1;\n\t"
+        "madc.lo.cc.u32 q1_m2, q1_a0, q1_b2, q1_m2;\n\t"
+        "madc.lo.cc.u32 q1_m3, q1_a0, q1_b3, q1_m3;\n\t"
+        "addc.u32 q1_m4, q1_m4, 0;\n\t"
+        "mad.hi.cc.u32 q1_m1, q1_a0, q1_b0, q1_m1;\n\t"
+        "madc.hi.cc.u32 q1_m2, q1_a0, q1_b1, q1_m2;\n\t"
+        "madc.hi.cc.u32 q1_m3, q1_a0, q1_b2, q1_m3;\n\t"
+        "madc.hi.u32 q1_m4, q1_a0, q1_b3, q1_m4;\n\t"
+        "mad.lo.cc.u32 q1_m1, q1_a1, q1_b0, q1_m1;\n\t"
+        "madc.lo.cc.u32 q1_m2, q1_a1, q1_b1, q1_m2;\n\t"
+        "madc.lo.cc.u32 q1_m3, q1_a1, q1_b2, q1_m3;\n\t"
+        "madc.lo.cc.u32 q1_m4, q1_a1, q1_b3, q1_m4;\n\t"
+        "addc.u32 q1_m5, q1_m5, 0;\n\t"
+        "mad.hi.cc.u32 q1_m2, q1_a1, q1_b0, q1_m2;\n\t"
+        "madc.hi.cc.u32 q1_m3, q1_a1, q1_b1, q1_m3;\n\t"
+        "madc.hi.cc.u32 q1_m4, q1_a1, q1_b2, q1_m4;\n\t"
+        "madc.hi.u32 q1_m5, q1_a1, q1_b3, q1_m5;\n\t"
+        "mad.lo.cc.u32 q1_m2, q1_a2, q1_b0, q1_m2;\n\t"
+        "madc.lo.cc.u32 q1_m3, q1_a2, q1_b1, q1_m3;\n\t"
+        "madc.lo.cc.u32 q1_m4, q1_a2, q1_b2, q1_m4;\n\t"
+        "madc.lo.cc.u32 q1_m5, q1_a2, q1_b3, q1_m5;\n\t"
+        "addc.u32 q1_m6, q1_m6, 0;\n\t"
+        "mad.hi.cc.u32 q1_m3, q1_a2, q1_b0, q1_m3;\n\t"
+        "madc.hi.cc.u32 q1_m4, q1_a2, q1_b1, q1_m4;\n\t"
+        "madc.hi.cc.u32 q1_m5, q1_a2, q1_b2, q1_m5;\n\t"
+        "madc.hi.u32 q1_m6, q1_a2, q1_b3, q1_m6;\n\t"
+        "mad.lo.cc.u32 q1_m3, q1_a3, q1_b0, q1_m3;\n\t"
+        "madc.lo.cc.u32 q1_m4, q1_a3, q1_b1, q1_m4;\n\t"
+        "madc.lo.cc.u32 q1_m5, q1_a3, q1_b2, q1_m5;\n\t"
+        "madc.lo.cc.u32 q1_m6, q1_a3, q1_b3, q1_m6;\n\t"
+        "addc.u32 q1_m7, q1_m7, 0;\n\t"
+        "mad.hi.cc.u32 q1_m4, q1_a3, q1_b0, q1_m4;\n\t"
+        "madc.hi.cc.u32 q1_m5, q1_a3, q1_b1, q1_m5;\n\t"
+        "madc.hi.cc.u32 q1_m6, q1_a3, q1_b2, q1_m6;\n\t"
+        "madc.hi.u32 q1_m7, q1_a3, q1_b3, q1_m7;\n\t"
+        "neg.s32 q1_mk, q1_a4;\n\t"
+        "and.b32 q1_k, q1_b0, q1_mk;\n\t"
+        "add.cc.u32 q1_m4, q1_m4, q1_k;\n\t"
+        "and.b32 q1_k, q1_b1, q1_mk;\n\t"
+        "addc.cc.u32 q1_m5, q1_m5, q1_k;\n\t"
+        "and.b32 q1_k, q1_b2, q1_mk;\n\t"
+        "addc.cc.u32 q1_m6, q1_m6, q1_k;\n\t"
+        "and.b32 q1_k, q1_b3, q1_mk;\n\t"
+        "addc.cc.u32 q1_m7, q1_m7, q1_k;\n\t"
+        "addc.u32 q1_m8, q1_m8, 0;\n\t"
+        "neg.s32 q1_mk, q1_b4;\n\t"
+        "and.b32 q1_k, q1_a0, q1_mk;\n\t"
+        "add.cc.u32 q1_m4, q1_m4, q1_k;\n\t"
+        "and.b32 q1_k, q1_a1, q1_mk;\n\t"
+        "addc.cc.u32 q1_m5, q1_m5, q1_k;\n\t"
+        "and.b32 q1_k, q1_a2, q1_mk;\n\t"
+        "addc.cc.u32 q1_m6, q1_m6, q1_k;\n\t"
+        "and.b32 q1_k, q1_a3, q1_mk;\n\t"
+        "addc.cc.u32 q1_m7, q1_m7, q1_k;\n\t"
+        "addc.u32 q1_m8, q1_m8, 0;\n\t"
+        "and.b32 q1_k, q1_a4, q1_b4;\n\t"
+        "add.u32 q1_m8, q1_m8, q1_k;\n\t"
+        "sub.cc.u32 q1_m0, q1_m0, t0;\n\t"
+        "subc.cc.u32 q1_m1, q1_m1, t1;\n\t"
+        "subc.cc.u32 q1_m2, q1_m2, t2;\n\t"
+        "subc.cc.u32 q1_m3, q1_m3, t3;\n\t"
+        "subc.cc.u32 q1_m4, q1_m4, t4;\n\t"
+        "subc.cc.u32 q1_m5, q1_m5, t5;\n\t"
+        "subc.cc.u32 q1_m6, q1_m6, t6;\n\t"
+        "subc.cc.u32 q1_m7, q1_m7, t7;\n\t"
+        "subc.u32 q1_m8, q1_m8, 0;\n\t"
+        "sub.cc.u32 q1_m0, q1_m0, t8;\n\t"
+        "subc.cc.u32 q1_m1, q1_m1, t9;\n\t"
+        "subc.cc.u32 q1_m2, q1_m2, t10;\n\t"
+        "subc.cc.u32 q1_m3, q1_m3, t11;\n\t"
+        "subc.cc.u32 q1_m4, q1_m4, t12;\n\t"
+        "subc.cc.u32 q1_m5, q1_m5, t13;\n\t"
+        "subc.cc.u32 q1_m6, q1_m6, t14;\n\t"
+        "subc.cc.u32 q1_m7, q1_m7, t15;\n\t"
+        "subc.u32 q1_m8, q1_m8, 0;\n\t"
+        "add.cc.u32 t4, t4, q1_m0;\n\t"
+        "addc.cc.u32 t5, t5, q1_m1;\n\t"
+        "addc.cc.u32 t6, t6, q1_m2;\n\t"
+        "addc.cc.u32 t7, t7, q1_m3;\n\t"
+        "addc.cc.u32 t8, t8, q1_m4;\n\t"
+        "addc.cc.u32 t9, t9, q1_m5;\n\t"
+        "addc.cc.u32 t10, t10, q1_m6;\n\t"
+        "addc.cc.u32 t11, t11, q1_m7;\n\t"
+        "addc.cc.u32 t12, t12, q1_m8;\n\t"
+        "addc.cc.u32 t13, t13, 0;\n\t"
+        "addc.cc.u32 t14, t14, 0;\n\t"
+        "addc.cc.u32 t15, t15, 0;\n\t"
+        "addc.u32 q1_k, 0, 0;\n\t"
         ".reg .u32 c;\n\t"
         "mad.lo.cc.u32 %0, t8, 38, t0;\n\t"
         "madc.lo.cc.u32 %1, t9, 38, t1;\n\t"
@@ -982,9 +1032,10 @@ __device__ __forceinline__ void madd_entry(fe8 X, fe8 Y, fe8 Z, fe8 T, const uin
 }
 
 template <int W>
-__global__ void __launch_bounds__(256, GEN_MINB) k_gen(GenParams P) {
+__global__ void __launch_bounds__(GEN_THREADS, GEN_MINB) k_gen(GenParams P) {
     constexpr int NWIN = (251 + W - 1) / W;
     constexpr int HALF = 1 << (W - 1);
+    constexpr int W0N = 2 * HALF + 1;
     const u32 stride = gridDim.x * blockDim.x;
     for (u32 i = blockIdx.x * blockDim.x + threadIdx.x; i < P.nk; i += stride) {
         u32 seed[8];
@@ -997,14 +1048,24 @@ __global__ void __launch_bounds__(256, GEN_MINB) k_gen(GenParams P) {
         u64 t2 = (s[2] >> 3) | (s[3] << 61);
         u64 t3 = (s[3] >> 3) & ((1ULL << 59) - 1);
 
+        // window 0: start point 2^254*G + d0*8*G, affine
+        int d0 = (int)((u32)t0 & ((1u << W) - 1));
+        t0 = (t0 >> W) | (t1 << (64 - W));
+        t1 = (t1 >> W) | (t2 << (64 - W));
+        t2 = (t2 >> W) | (t3 << (64 - W));
+        t3 >>= W;
+        u32 carry = d0 > HALF;
+        if (carry) d0 -= (1 << W);
         fe8 X, Y, Z, T;
+        const uint4 *e0 = P.table + (size_t)(d0 + HALF) * 6;
+        load_fe8(X, e0); load_fe8(Y, e0 + 2); load_fe8(T, e0 + 4);
         #pragma unroll
-        for (int l = 0; l < 8; l++) { X[l] = g_start8[0][l]; Y[l] = g_start8[1][l]; T[l] = g_start8[2][l]; Z[l] = 0; }
+        for (int l = 0; l < 8; l++) Z[l] = 0;
         Z[0] = 1;
 
-        u32 carry = 0;
-        #pragma unroll 1
-        for (int k = 0; k < NWIN; k++) {
+        // Digits are produced one window ahead so the next table entry can be prefetched
+        // into L2 while the current addition runs (matters once the table outgrows L2).
+        auto next_digit = [&](int k) {
             int d = (int)((u32)t0 & ((1u << W) - 1)) + (int)carry;
             t0 = (t0 >> W) | (t1 << (64 - W));
             t1 = (t1 >> W) | (t2 << (64 - W));
@@ -1014,10 +1075,26 @@ __global__ void __launch_bounds__(256, GEN_MINB) k_gen(GenParams P) {
                 carry = d > HALF;
                 if (carry) d -= (1 << W);
             }
-            if (d != 0) {
-                int ad = d < 0 ? -d : d;
-                madd_entry(X, Y, Z, T, P.table + (size_t)(k * HALF + ad - 1) * 6, d < 0, k < NWIN - 1);
+            return d;
+        };
+        auto entry = [&](int k, int d) {
+            int ad = d < 0 ? -d : d;
+            return P.table + (size_t)(W0N + (k - 1) * HALF + ad - 1) * 6;
+        };
+        auto prefetch = [&](int k, int d) {
+            const uint4 *pe = entry(k, d);
+            asm volatile("prefetch.global.L2 [%0];" :: "l"(pe));
+            asm volatile("prefetch.global.L2 [%0];" :: "l"(pe + 5));
+        };
+        int dn = next_digit(1);
+        #pragma unroll 1
+        for (int k = 1; k < NWIN; k++) {
+            int d = dn;
+            if (k + 1 < NWIN) {
+                dn = next_digit(k + 1);
+                prefetch(k + 1, dn);
             }
+            if (d != 0) madd_entry(X, Y, Z, T, entry(k, d), d < 0, k < NWIN - 1);
         }
         #pragma unroll
         for (int l = 0; l < 8; l++) {
@@ -1379,7 +1456,8 @@ struct Slot {
     Match *d_match; u32 *d_nmatch;
     u32 *h_counts;      // pinned: [ncand, nmatch]
     Match *h_match;     // pinned
-    cudaEvent_t done;
+    u32 *X, *Y, *Z, *Pf;   // projective points and prefix products of this batch
+    cudaEvent_t gen_done, done;
     u64 base_index;
     bool busy;
 };
@@ -1389,11 +1467,10 @@ struct Dev {
     cudaDeviceProp prop;
     CombCfg cfg;
     uint4 *d_table;
-    u32 *X, *Y, *Z, *Pf;
     u32 nk, mc, inv_threads;
     u32 cand_cap, match_cap;
     int gen_blocks;
-    cudaStream_t stream, copy;
+    cudaStream_t stream, inv_stream, copy;   // k_gen (low priority) / k_inv + k_check (high)
     Slot slot[2];
     u32 key[8];
     u64 next_index;
@@ -1410,6 +1487,7 @@ static GenLaunch gen_for(int w) {
     case 8: return launch_gen<8>;   case 9: return launch_gen<9>;   case 10: return launch_gen<10>;
     case 11: return launch_gen<11>; case 12: return launch_gen<12>; case 13: return launch_gen<13>;
     case 14: return launch_gen<14>; case 15: return launch_gen<15>; case 16: return launch_gen<16>;
+    case 17: return launch_gen<17>; case 18: return launch_gen<18>;
     }
     return nullptr;
 }
@@ -1418,6 +1496,7 @@ static const void *gen_func(int w) {
     case 8: return (const void *)k_gen<8>;   case 9: return (const void *)k_gen<9>;   case 10: return (const void *)k_gen<10>;
     case 11: return (const void *)k_gen<11>; case 12: return (const void *)k_gen<12>; case 13: return (const void *)k_gen<13>;
     case 14: return (const void *)k_gen<14>; case 15: return (const void *)k_gen<15>; case 16: return (const void *)k_gen<16>;
+    case 17: return (const void *)k_gen<17>; case 18: return (const void *)k_gen<18>;
     }
     return nullptr;
 }
@@ -1432,19 +1511,21 @@ struct Options {
     bool all_devices = false;
     double bench = 0;
     bool selftest = false;
+    bool tune = false;
     int batch_log2 = 22;
-    int mc = 64;
+    int mc = 128;
     bool l2persist = true;
     bool quiet_matches = false;
 };
 
 static int auto_window(const cudaDeviceProp &p) {
-    // Largest window whose table stays within ~60% of L2, capped at 16.
-    for (int w = 16; w >= 8; w--) {
+    // Largest window whose table stays within ~80% of L2 (at least 12: the next entry is
+    // prefetched, so a table partly in DRAM still beats many more additions). --tune measures.
+    for (int w = 17; w > 12; w--) {
         CombCfg c = comb_cfg(w);
-        if ((double)c.entries * 96.0 <= 0.6 * p.l2CacheSize) return w;
+        if ((double)c.entries * 96.0 <= 0.8 * p.l2CacheSize) return w;
     }
-    return 8;
+    return 12;
 }
 
 static void dev_init(Dev &d, int id, const Options &o, const PatternSet &ps) {
@@ -1458,7 +1539,10 @@ static void dev_init(Dev &d, int id, const Options &o, const PatternSet &ps) {
     d.inv_threads = d.nk / d.mc;
     d.cand_cap = d.nk;
     d.match_cap = 1u << 16;
-    CUDA_CHECK(cudaStreamCreateWithFlags(&d.stream, cudaStreamNonBlocking));
+    int prio_lo = 0, prio_hi = 0;
+    CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&prio_lo, &prio_hi));
+    CUDA_CHECK(cudaStreamCreateWithPriority(&d.stream, cudaStreamNonBlocking, prio_lo));
+    CUDA_CHECK(cudaStreamCreateWithPriority(&d.inv_stream, cudaStreamNonBlocking, prio_hi));
     CUDA_CHECK(cudaStreamCreateWithFlags(&d.copy, cudaStreamNonBlocking));
 
     // Table
@@ -1471,7 +1555,7 @@ static void dev_init(Dev &d, int id, const Options &o, const PatternSet &ps) {
     CUDA_CHECK(cudaGetLastError());
     for (int first = 0; first < d.cfg.entries; first += 65536) {
         int cnt = std::min(65536, d.cfg.entries - first);
-        k_table<<<(cnt + 127) / 128, 128>>>(d.d_table, d_bases, d.cfg.half, d.cfg.nwin, first, cnt, d.cfg.entries);
+        k_table<<<(cnt + 127) / 128, 128>>>(d.d_table, d_bases, d.cfg.half, d.cfg.nwin, d.cfg.w0n, first, cnt, d.cfg.entries);
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaDeviceSynchronize());
     }
@@ -1493,12 +1577,13 @@ static void dev_init(Dev &d, int id, const Options &o, const PatternSet &ps) {
     }
 
     size_t fe_bytes = (size_t)d.nk * 32;
-    CUDA_CHECK(cudaMalloc(&d.X, fe_bytes));
-    CUDA_CHECK(cudaMalloc(&d.Y, fe_bytes));
-    CUDA_CHECK(cudaMalloc(&d.Z, fe_bytes));
-    CUDA_CHECK(cudaMalloc(&d.Pf, fe_bytes));
     for (int s = 0; s < 2; s++) {
         Slot &sl = d.slot[s];
+        CUDA_CHECK(cudaMalloc(&sl.X, fe_bytes));
+        CUDA_CHECK(cudaMalloc(&sl.Y, fe_bytes));
+        CUDA_CHECK(cudaMalloc(&sl.Z, fe_bytes));
+        CUDA_CHECK(cudaMalloc(&sl.Pf, fe_bytes));
+        CUDA_CHECK(cudaEventCreateWithFlags(&sl.gen_done, cudaEventDisableTiming));
         CUDA_CHECK(cudaMalloc(&sl.d_cand, sizeof(Cand) * d.cand_cap));
         CUDA_CHECK(cudaMalloc(&sl.d_ncand, 4));
         CUDA_CHECK(cudaMalloc(&sl.d_match, sizeof(Match) * d.match_cap));
@@ -1528,14 +1613,16 @@ static void dev_init(Dev &d, int id, const Options &o, const PatternSet &ps) {
     d.cur = 0;
 
     int per_sm = 0;
-    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, gen_func(d.cfg.w), 256, 0));
-    d.gen_blocks = d.prop.multiProcessorCount * std::max(per_sm, 1);
+    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, gen_func(d.cfg.w), GEN_THREADS, 0));
+    // Many short blocks, so k_inv of the previous batch (high-priority stream) can slot in
+    // between k_gen blocks: memory-bound and compute-bound work then overlap.
+    d.gen_blocks = std::max(d.prop.multiProcessorCount * std::max(per_sm, 1), (int)(d.nk / (GEN_THREADS * 16)));
     cudaFuncAttributes fa;
     CUDA_CHECK(cudaFuncGetAttributes(&fa, gen_func(d.cfg.w)));
 
     printf("GPU %d:   %s (SM %d.%d, %d SMs, L2 %d MB)\n", id, d.prop.name, d.prop.major, d.prop.minor,
            d.prop.multiProcessorCount, d.prop.l2CacheSize >> 20);
-    printf("         comb W=%d: %d windows, table %.1f MB built in %.2fs; gen %d regs, %d blocks/SM; batch %u keys\n",
+    printf("         comb W=%d: %d windows (first folded into the start point), table %.1f MB built in %.2fs; gen %d regs, %d blocks/SM; batch %u keys\n",
            d.cfg.w, d.cfg.nwin, tbytes / 1048576.0, tsec, fa.numRegs, per_sm, d.nk);
 }
 
@@ -1547,40 +1634,47 @@ static void dev_enqueue(Dev &d) {
     CUDA_CHECK(cudaSetDevice(d.id));
     sl.base_index = d.next_index;
     d.next_index += d.nk;
-    CUDA_CHECK(cudaMemsetAsync(sl.d_ncand, 0, 4, d.stream));
-    CUDA_CHECK(cudaMemsetAsync(sl.d_nmatch, 0, 4, d.stream));
+    CUDA_CHECK(cudaMemsetAsync(sl.d_ncand, 0, 4, d.inv_stream));
+    CUDA_CHECK(cudaMemsetAsync(sl.d_nmatch, 0, 4, d.inv_stream));
     GenParams gp;
     memcpy(gp.key, d.key, sizeof(gp.key));
     gp.nonce = (u32)d.id;
     gp.base_index = sl.base_index;
     gp.nk = d.nk;
     gp.table = d.d_table;
-    gp.X = d.X; gp.Y = d.Y; gp.Z = d.Z;
+    gp.X = sl.X; gp.Y = sl.Y; gp.Z = sl.Z;
     if (g_prof) CUDA_CHECK(cudaEventRecord(g_prof_ev[0], d.stream));
-    gen_for(d.cfg.w)(d.gen_blocks, 256, d.stream, gp);
+    gen_for(d.cfg.w)(d.gen_blocks, GEN_THREADS, d.stream, gp);
     if (g_prof) CUDA_CHECK(cudaEventRecord(g_prof_ev[1], d.stream));
+    CUDA_CHECK(cudaEventRecord(sl.gen_done, d.stream));
+    CUDA_CHECK(cudaStreamWaitEvent(d.inv_stream, sl.gen_done, 0));
     InvParams ip;
-    ip.X = d.X; ip.Y = d.Y; ip.Z = d.Z; ip.Pf = d.Pf;
+    ip.X = sl.X; ip.Y = sl.Y; ip.Z = sl.Z; ip.Pf = sl.Pf;
     ip.nk = d.nk; ip.nthreads = d.inv_threads; ip.mc = d.mc;
     ip.cand = sl.d_cand; ip.ncand = sl.d_ncand; ip.cand_cap = d.cand_cap;
     ip.dump = d.d_dump;
-    k_inv<<<(d.inv_threads + 255) / 256, 256, 0, d.stream>>>(ip);
-    if (g_prof) CUDA_CHECK(cudaEventRecord(g_prof_ev[2], d.stream));
-    k_check<<<d.prop.multiProcessorCount * 4, 256, 0, d.stream>>>(sl.d_cand, sl.d_ncand, d.cand_cap,
-                                                                  sl.d_match, sl.d_nmatch, d.match_cap);
-    if (g_prof) CUDA_CHECK(cudaEventRecord(g_prof_ev[3], d.stream));
+    k_inv<<<(d.inv_threads + 255) / 256, 256, 0, d.inv_stream>>>(ip);
+    if (g_prof) CUDA_CHECK(cudaEventRecord(g_prof_ev[2], d.inv_stream));
+    k_check<<<d.prop.multiProcessorCount * 4, 256, 0, d.inv_stream>>>(sl.d_cand, sl.d_ncand, d.cand_cap,
+                                                                      sl.d_match, sl.d_nmatch, d.match_cap);
+    if (g_prof) CUDA_CHECK(cudaEventRecord(g_prof_ev[3], d.inv_stream));
     CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaMemcpyAsync(sl.h_counts, sl.d_ncand, 4, cudaMemcpyDeviceToHost, d.stream));
-    CUDA_CHECK(cudaMemcpyAsync(sl.h_counts + 1, sl.d_nmatch, 4, cudaMemcpyDeviceToHost, d.stream));
-    CUDA_CHECK(cudaEventRecord(sl.done, d.stream));
+    CUDA_CHECK(cudaMemcpyAsync(sl.h_counts, sl.d_ncand, 4, cudaMemcpyDeviceToHost, d.inv_stream));
+    CUDA_CHECK(cudaMemcpyAsync(sl.h_counts + 1, sl.d_nmatch, 4, cudaMemcpyDeviceToHost, d.inv_stream));
+    CUDA_CHECK(cudaEventRecord(sl.done, d.inv_stream));
     sl.busy = true;
     d.cur ^= 1;
 }
 
 struct Stats { u64 found = 0, mismatched = 0, dropped = 0, keys = 0; };
 
-// Host check of one GPU match; returns true if written.
-static bool handle_match(const Dev &d, const PatternSet &ps, const Match &m, u64 base, FILE *csv, Stats &st, bool quiet) {
+// Host check of one GPU match: re-derive the seed, recompute the key with the reference
+// implementation and re-check the pattern. Thread-safe.
+struct Checked { bool ok; std::string pub, priv; };
+
+static Checked check_match(const Dev &d, const PatternSet &ps, const Match &m, u64 base) {
+    Checked c;
+    c.ok = false;
     u64 index = base + m.idx;
     u32 sw[8];
     chacha12_seed(d.key, index, (u32)d.id, sw);
@@ -1588,17 +1682,15 @@ static bool handle_match(const Dev &d, const PatternSet &ps, const Match &m, u64
     words_to_bytes(sw, seed);
     ref_pubkey(seed, pk);
     words_to_bytes(m.pk, gpk);
-    if (memcmp(pk, gpk, 32) != 0) { st.mismatched++; return false; }
-    std::string pub = b58_bytes(pk, 32);
-    if (!host_match(ps, pub.c_str(), (int)pub.size())) { st.mismatched++; return false; }
+    if (memcmp(pk, gpk, 32) != 0) return c;
+    c.pub = b58_bytes(pk, 32);
+    if (!host_match(ps, c.pub.c_str(), (int)c.pub.size())) return c;
     u8 full[64];
     memcpy(full, seed, 32);
     memcpy(full + 32, pk, 32);
-    std::string priv = b58_bytes(full, 64);
-    if (csv) { fprintf(csv, "%s,%s\n", pub.c_str(), priv.c_str()); fflush(csv); }
-    st.found++;
-    if (!quiet) printf("Found #%llu: %s\n", (unsigned long long)st.found, pub.c_str());
-    return true;
+    c.priv = b58_bytes(full, 64);
+    c.ok = true;
+    return c;
 }
 
 // Waits for the oldest busy slot of a device and processes it.
@@ -1612,19 +1704,67 @@ static void dev_drain_one(Dev &d, const PatternSet &ps, FILE *csv, Stats &st, lo
     u32 nc = sl.h_counts[0], nm = sl.h_counts[1];
     if (nc > d.cand_cap) st.dropped += nc - d.cand_cap;
     if (nm > d.match_cap) { st.dropped += nm - d.match_cap; nm = d.match_cap; }
-    if (nm) {
-        CUDA_CHECK(cudaMemcpyAsync(sl.h_match, sl.d_match, sizeof(Match) * nm, cudaMemcpyDeviceToHost, d.copy));
-        CUDA_CHECK(cudaStreamSynchronize(d.copy));
-        for (u32 i = 0; i < nm; i++) {
-            if (limit > 0 && (long long)st.found >= limit) break;
-            handle_match(d, ps, sl.h_match[i], sl.base_index, csv, st, quiet);
-        }
+    if (!nm) return;
+    if (limit > 0) nm = (u32)std::min<long long>(nm, std::max<long long>(0, limit - (long long)st.found));
+    CUDA_CHECK(cudaMemcpyAsync(sl.h_match, sl.d_match, sizeof(Match) * nm, cudaMemcpyDeviceToHost, d.copy));
+    CUDA_CHECK(cudaStreamSynchronize(d.copy));
+    std::vector<Checked> out(nm);
+    unsigned nt = std::min<unsigned>(std::max(1u, std::thread::hardware_concurrency()), (nm + 63) / 64);
+    if (nt <= 1) {
+        for (u32 i = 0; i < nm; i++) out[i] = check_match(d, ps, sl.h_match[i], sl.base_index);
+    } else {
+        std::vector<std::thread> th;
+        for (unsigned t = 0; t < nt; t++)
+            th.emplace_back([&, t]() { for (u32 i = t; i < nm; i += nt) out[i] = check_match(d, ps, sl.h_match[i], sl.base_index); });
+        for (auto &x : th) x.join();
     }
+    for (auto &c : out) {
+        if (!c.ok) { st.mismatched++; continue; }
+        if (csv) fprintf(csv, "%s,%s\n", c.pub.c_str(), c.priv.c_str());
+        st.found++;
+        if (!quiet) printf("Found #%llu: %s\n", (unsigned long long)st.found, c.pub.c_str());
+    }
+    if (csv) fflush(csv);
 }
 
 // ============================================================================
 // Self-test
 // ============================================================================
+
+// Rate of one device for a few seconds with window w (no output written).
+static double measure_window(Options o, int w, double seconds) {
+    o.window = w;
+    PatternSet ps;
+    build_patterns(ps, { {"", "zzzzzzzzzz"} });
+    Dev d;
+    dev_init(d, o.devices.empty() ? 0 : o.devices[0], o, ps);
+    Stats st;
+    dev_enqueue(d); dev_enqueue(d);
+    for (int i = 0; i < 4; i++) { dev_drain_one(d, ps, nullptr, st, -1, true); dev_enqueue(d); }   // warm-up
+    u64 k0 = st.keys;
+    auto t0 = std::chrono::steady_clock::now();
+    double el = 0;
+    while ((el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count()) < seconds) {
+        dev_drain_one(d, ps, nullptr, st, -1, true);
+        dev_enqueue(d);
+    }
+    double rate = (st.keys - k0) / el;
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaDeviceReset());
+    return rate;
+}
+
+static int tune(Options o) {
+    double best = 0;
+    int bw = 0;
+    for (int w = 11; w <= 18; w++) {
+        double r = measure_window(o, w, 4.0);
+        printf("  W=%-2d  %8.2fM keys/sec\n\n", w, r / 1e6);
+        if (r > best) { best = r; bw = w; }
+    }
+    printf("Fastest: -w %d (%.2fM keys/sec)\n", bw, best / 1e6);
+    return 0;
+}
 
 static int selftest(Options o) {
     int fails = 0;
@@ -1642,7 +1782,7 @@ static int selftest(Options o) {
     // 2. GPU keys vs host reference, and GPU matcher vs host matcher, for each window size.
     std::vector<int> windows;
     if (o.window) windows.push_back(o.window);
-    else for (int w = 8; w <= 16; w++) windows.push_back(w);
+    else for (int w = 8; w <= 18; w++) windows.push_back(w);
     o.batch_log2 = std::min(o.batch_log2, 20);
     for (int w : windows) {
         o.window = w;
@@ -1706,11 +1846,12 @@ static void usage() {
         "  -n, --count N       stop after N matches (default: run forever)\n"
         "  -o, --out FILE      CSV output (default <suffix>_results.csv or vanity_results.csv)\n"
         "  -d, --device LIST   GPU ids, e.g. 0 or 0,1 or all (default 0)\n"
-        "  -w, --window W      comb window bits 8..16 (default: by L2 size)\n"
+        "  -w, --window W      comb window bits 8..18 (default: by L2 size)\n"
         "      --batch-log2 N  keys per batch = 2^N (default 22)\n"
         "      --bench SEC     run SEC seconds and print the average rate\n"
         "      --no-l2-persist do not pin the table in L2\n"
         "      --selftest      check GPU keys and matcher against the host reference\n"
+        "      --tune          measure window sizes on this GPU and print the fastest\n"
         "Patterns are OR-ed. Keys are written as public_key,private_key (Phantom/Solflare format).\n");
 }
 
@@ -1749,6 +1890,7 @@ int main(int argc, char **argv) {
         else if (a == "--bench") o.bench = atof(next().c_str());
         else if (a == "--no-l2-persist") o.l2persist = false;
         else if (a == "--selftest") o.selftest = true;
+        else if (a == "--tune") o.tune = true;
         else if (a == "--profile") g_prof = true;
         else if (a == "-h" || a == "--help") { usage(); return 0; }
         else if (!a.empty() && a[0] == '-') { fprintf(stderr, "error: unknown option %s\n", a.c_str()); usage(); return 1; }
@@ -1756,11 +1898,12 @@ int main(int argc, char **argv) {
     }
     if (pos.size() >= 1) o.pats.push_back({"", pos[0]});
     if (pos.size() >= 2) o.count = atoll(pos[1].c_str());
-    if (o.window && !gen_for(o.window)) { fprintf(stderr, "error: window must be 8..16\n"); return 1; }
+    if (o.window && !gen_for(o.window)) { fprintf(stderr, "error: window must be 8..18\n"); return 1; }
     if (o.batch_log2 < 16 || o.batch_log2 > 25 || o.mc < 1 || ((1u << o.batch_log2) % o.mc)) {
         fprintf(stderr, "error: bad --batch-log2 / --mc\n"); return 1;
     }
     if (o.selftest) return selftest(o);
+    if (o.tune) return tune(o);
     if (o.pats.empty()) o.pats.push_back({"", "pump"});
 
     PatternSet ps;
@@ -1841,7 +1984,7 @@ int main(int argc, char **argv) {
     }
     for (auto &d : devs) for (int k = 0; k < 2; k++) {
         Slot &sl = d.slot[d.cur];
-        if (sl.busy) { CUDA_CHECK(cudaSetDevice(d.id)); CUDA_CHECK(cudaEventSynchronize(sl.done)); sl.busy = false; st.keys += d.nk; }
+        if (sl.busy) { CUDA_CHECK(cudaSetDevice(d.id)); CUDA_CHECK(cudaEventSynchronize(sl.done)); sl.busy = false; }   // results discarded
         d.cur ^= 1;
     }
     double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
