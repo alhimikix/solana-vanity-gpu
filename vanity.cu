@@ -1725,6 +1725,7 @@ static void dev_drain_one(Dev &d, const PatternSet &ps, FILE *csv, Stats &st, lo
         if (!quiet) printf("Found #%llu: %s\n", (unsigned long long)st.found, c.pub.c_str());
     }
     if (csv) fflush(csv);
+    fflush(stdout);     // stdout is fully buffered when redirected
 }
 
 // ============================================================================
@@ -1938,6 +1939,7 @@ int main(int argc, char **argv) {
     std::vector<Dev> devs(o.devices.size());
     for (size_t k = 0; k < devs.size(); k++) dev_init(devs[k], o.devices[k], o, ps);
     printf("\n");
+    fflush(stdout);
 
     if (g_prof) {   // per-kernel time on the first device, serial batches
         Dev &d = devs[0];
