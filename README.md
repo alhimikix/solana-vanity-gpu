@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/logo.png" alt="solana-vanity-gpu — Solana vanity addresses at GPU speed" width="860"></p>
+
 # solana-vanity-gpu
 
 GPU grinder for Solana vanity addresses. Brute-forces ed25519 keypairs on CUDA until the base58 public key
@@ -10,6 +12,8 @@ https://github.com/user-attachments/assets/e398972d-8331-4d56-8764-61573bc38220
 
 **Try it in the browser:** https://alhimikix.github.io/solana-vanity-gpu/ — the same pipeline ported to
 WebGPU (~145M keys/sec on an RTX 5080 in Chrome, ~110M in Firefox). Keys are generated and checked on the page only.
+
+<p align="center"><a href="https://alhimikix.github.io/solana-vanity-gpu/"><img src="assets/screenshot.png" alt="The browser version: one terminal window, prefix/suffix search on the GPU" width="900"></a></p>
 
 ## Requirements
 
