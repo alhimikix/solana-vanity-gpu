@@ -15,9 +15,9 @@ NVCC="${NVCC:-nvcc}"
 
 mkdir -p "$OUTDIR"
 
-for arch in 75 86 89; do
+for arch in 75 86 89 120; do
     echo "Building sm_${arch}..."
-    "$NVCC" -O3 -arch="sm_${arch}" -o "$OUTDIR/vanity_gpu_sm${arch}" vanity.cu
+    "$NVCC" -O3 -arch="sm_${arch}" -Xcompiler -pthread -o "$OUTDIR/vanity_gpu_sm${arch}" vanity.cu
 done
 
 cp README.md LICENSE CHANGELOG.md build.sh "$OUTDIR/"

@@ -24,11 +24,13 @@ if not exist "%VS_VCVARS%" (
 
 call "%VS_VCVARS%" >nul
 
-REM -arch=sm_86 targets RTX 30xx (Ampere). For other GPUs:
+REM SM_ARCH defaults to native (the GPU in this machine). Or set it, e.g.:
 REM   sm_75 = RTX 20xx, GTX 16xx
 REM   sm_86 = RTX 30xx, A100/A40
 REM   sm_89 = RTX 40xx, L40
 REM   sm_90 = H100, GH200
-"%CUDA_HOME%\bin\nvcc.exe" -O3 -arch=sm_86 -allow-unsupported-compiler -Xcompiler "/O2 /MD" -o vanity_gpu.exe vanity.cu
+REM   sm_120 = RTX 50xx (CUDA 12.8+)
+if "%SM_ARCH%"=="" set SM_ARCH=native
+"%CUDA_HOME%\bin\nvcc.exe" -O3 -arch=%SM_ARCH% -allow-unsupported-compiler -Xcompiler "/O2 /MD" -o vanity_gpu.exe vanity.cu
 if errorlevel 1 exit /b 1
 echo Build OK: vanity_gpu.exe

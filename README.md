@@ -1,136 +1,165 @@
 # solana-vanity-gpu
 
-GPU grinder for Solana vanity addresses. Brute-forces ed25519 keypairs on CUDA until the base58 public key ends with the desired suffix.
+GPU grinder for Solana vanity addresses. Brute-forces ed25519 keypairs on CUDA until the base58 public key
+starts and/or ends with what you want. Several patterns can be searched at once, case-insensitive if needed.
 
-**~44M keys/sec on RTX 3090.** ~97x faster than CPU baseline (16 threads on 8/16-core CPU).
+**~410M keys/sec on an RTX 5080** (the v1.0.0 kernel does 67–70M on the same card). Keys are standard
+32-byte seeds, so they import into Phantom, Solflare and `solana-keygen` as usual.
 
 ## Requirements
 
-- **NVIDIA GPU** with Compute Capability ≥ 7.5 (RTX 20xx and newer). Default build targets `sm_86` (RTX 30xx). Change `-arch=sm_XX` in `build.bat` / `build.sh` for other GPUs.
-- **CUDA Toolkit** ≥ 12.0 (`nvcc`). Tested with 13.1.
+- **NVIDIA GPU** with Compute Capability ≥ 7.5 (RTX 20xx and newer).
+- **CUDA Toolkit** ≥ 12.0 (`nvcc`); ≥ 12.8 for RTX 50xx (`sm_120`). Tested with 13.4.
 - **MSVC** (Visual Studio 2019/2022, or 2025 with `-allow-unsupported-compiler`) on Windows. GCC on Linux.
 
 ## Installation
 
-### Pre-built binaries (recommended)
+### Pre-built binaries
 
 Download from [Releases](../../releases):
 
 - `solana-vanity-gpu-vX.Y.Z-windows-x64.zip` — Windows
 - `solana-vanity-gpu-vX.Y.Z-linux-x64.tar.gz` — Linux
 
-Each archive contains three binaries for different GPUs:
+Each archive contains one binary per GPU generation:
 - `vanity_gpu_sm75` — RTX 20xx, GTX 16xx (Turing)
 - `vanity_gpu_sm86` — RTX 30xx, A100 (Ampere)
 - `vanity_gpu_sm89` — RTX 40xx, L40 (Ada)
-
-Run the one matching your GPU. If unsure, try one — incompatible binaries fail with a CUDA error immediately.
+- `vanity_gpu_sm120` — RTX 50xx (Blackwell)
 
 ### Build from source
 
 **Windows:**
 ```bash
-.\build.bat
+.\build.bat                       # builds for the GPU in this machine
+set SM_ARCH=sm_89 & .\build.bat   # or for a given architecture
 ```
 
-**Linux/macOS:**
+**Linux:**
 ```bash
-./build.sh                        # default: sm_86 (Ampere)
-SM_ARCH=sm_89 ./build.sh          # for RTX 40xx
-SM_ARCH=sm_90 ./build.sh          # for H100
+./build.sh                        # builds for the GPU in this machine
+SM_ARCH=sm_120 ./build.sh         # or for a given architecture
 ```
 
-Produces `vanity_gpu.exe` (or `vanity_gpu`).
+Produces `vanity_gpu.exe` (or `vanity_gpu`). After building, run `vanity_gpu --selftest` once.
 
 ### Local release packaging
 
 ```bash
-# Windows: builds sm_75/sm_86/sm_89 + zip
-scripts\package-release.bat v1.0.0
-
-# Linux: builds sm_75/sm_86/sm_89 + tar.gz
-scripts/package-release.sh v1.0.0
+scripts\package-release.bat v2.0.0     # Windows: sm_75/86/89/120 + zip
+scripts/package-release.sh v2.0.0      # Linux:   sm_75/86/89/120 + tar.gz
 ```
-
-Output: `release/solana-vanity-gpu-v1.0.0-{windows,linux}-x64.{zip,tar.gz}`.
 
 ## Usage
 
 ```bash
-# Run forever, write matches to pump_results.csv (Ctrl+C to stop)
-.\vanity_gpu.exe pump
+vanity_gpu pump                 # suffix "pump", run forever (old form still works)
+vanity_gpu pump 100             # 100 matches, then exit
 
-# Find 100 matches and exit
-.\vanity_gpu.exe pump 100
+vanity_gpu -s pump -n 10        # ends with pump
+vanity_gpu -p Sol -n 10         # starts with Sol
+vanity_gpu -m "So*pump" -n 1    # starts with So AND ends with pump
+vanity_gpu -s pump -s bonk -i   # ends with pump OR bonk, any letter case
 ```
 
-CSV format: `public_key,private_key` (both base58). The file `<suffix>_results.csv` is created automatically; the header is written once. Subsequent runs append to it.
+| Option | Meaning |
+|---|---|
+| `-s, --suffix S` | address ends with `S` (repeatable) |
+| `-p, --prefix P` | address starts with `P` (repeatable) |
+| `-m, --match P*S` | starts with `P` and ends with `S`: `abc*`, `*xyz`, `ab*yz` (repeatable) |
+| `-i, --ignore-case` | case-insensitive matching |
+| `-n, --count N` | stop after `N` matches |
+| `-o, --out FILE` | CSV file (default `<suffix>_results.csv` for one suffix, else `vanity_results.csv`) |
+| `-d, --device LIST` | GPUs to use: `0`, `0,1`, `all` |
+| `-w, --window W` | comb window, 8..18 bits (default chosen from the L2 cache size) |
+| `--tune` | measure all window sizes on this GPU and print the fastest |
+| `--selftest` | check GPU keys and the matcher against the host reference |
+| `--bench SEC` | run `SEC` seconds and print the average rate |
+| `--profile` | time each kernel |
 
-Allowed suffix characters: base58 alphabet (`123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz`). Note: `0`, `O`, `I`, `l` are excluded by base58 — using them in a suffix produces an error.
+All patterns are OR-ed. At start the program prints the odds (`1 in N keys`) and, while running, the
+expected time per match at the current speed.
 
-## Video
+Base58 has no `0`, `O`, `I`, `l`. With `-i` a letter only needs one usable case (`l` matches `L`).
 
+CSV format: `public_key,private_key` (both base58). The file is created with a header and appended to on
+later runs.
 
-https://github.com/user-attachments/assets/4febabee-5b8f-4d1f-bbed-f29c04d047f9
+### Prefixes
 
-
-
-## Importing keys
-
-The `private_key` column is a 64-byte base58 string in Phantom/Solflare format:
-
-- **Phantom:** Settings → Add/Connect Wallet → Import Private Key → paste the string.
-- **Solflare:** Wallet → Import → Private Key.
-- **Solana CLI:** convert to a 64-byte JSON array via `solana-keygen` or use directly.
+A Solana address is 43 or 44 characters. 44-character addresses can only start with `2`…`H` (or `1`),
+so a prefix whose first character is later in the alphabet (`J`…`z`) only appears in 43-character
+addresses — roughly 17 times rarer than a suffix of the same length. The odds line accounts for this.
 
 ## Performance
 
-| Suffix length | Combinations | Average wait at 44M k/s |
-|---------------|-------------|-------------------------|
-| 4 (`pump`)    | 11.3 M       | <1 second               |
-| 5             | 656 M        | ~15 seconds             |
-| 6             | 38 G         | ~15 minutes             |
-| 7             | 2.2 T        | ~14 hours               |
-| 8             | 128 T        | ~1 month                |
+RTX 5080 (driver 617, CUDA 13.4, default settings):
 
-The distribution is geometric — you may get lucky in seconds, or it may take 2–3x the average.
+| Pattern length | Combinations | Average wait at 410M k/s |
+|---|---|---|
+| 4 (`pump`) | 11.3 M | 0.03 seconds |
+| 5 | 656 M | ~1.6 seconds |
+| 6 | 38 G | ~1.5 minutes |
+| 7 | 2.2 T | ~1.5 hours |
+| 8 | 128 T | ~3.6 days |
+
+Prefixes starting with `J`…`z` take about 17 times longer. The wait is geometric — you may get lucky
+in seconds, or it may take 2–3x the average.
+
+Optimisation steps, same RTX 5080:
+
+| Step | k/s |
+|---|---|
+| v1.0.0 kernel (built for sm_120) | 67–70M |
+| 16-bit comb windows, batch inversion in its own kernel, no register spills | 255M |
+| 32-bit-limb field arithmetic in PTX instead of radix-2^25.5 | 359M |
+| Karatsuba multiply, first window folded into the start point | 386M |
+| Inversion kernel overlapped with the next batch on a high-priority stream | 408M |
+| Prefetch of the next table entry into L2 | 413–419M |
 
 ## How it works
 
-Optimization journey:
+Per key: `seed = ChaCha12(run key, index)` → SHA-512 → clamp → fixed-base scalar multiplication →
+batched inversion → `y` and the sign of `x` → pattern check.
 
-| Version | k/s | vs CPU |
-|---------|-----|--------|
-| CPU 16 threads (TweetNaCl-style ed25519) | 455k | 1x |
-| GPU naive (TweetNaCl port to CUDA) | 311k | 0.68x |
-| + 8-bit signed-digit comb scalar mult | 4.65M | 10x |
-| + Donna fe10 (radix-2^25.5) field arithmetic | 31M | 68x |
-| + Within-thread Montgomery batched inversion (N=4) | 38M | 84x |
-| + Suffix mod-58^K prefilter | **44M** | **97x** |
+1. **Comb with wide signed windows.** The clamped scalar is `2^254 + 8t`, `t < 2^251`. `t` is cut into
+   W-bit windows recoded to signed digits in `[-2^(W-1), 2^(W-1)]`, one table of `j · 8 · 2^(Wk) · G`
+   per window. With W=16 that is 15 point additions per key instead of 32. Window 0 is folded into the
+   start point: its table holds `2^254·G + d·8·G` directly, so the first addition disappears. Entries are
+   96 bytes (Y+X, Y−X, 2dXY); the W=16 table is 48 MB and lives in L2 on cards with a big L2. The entry for
+   the next window is prefetched into L2 while the current addition runs, so wider windows (17, 18) whose
+   tables spill to DRAM still work. `--tune` picks the best W for a given card.
 
-Implementation details:
+2. **Field arithmetic on 8 × 32-bit limbs.** GF(2^255−19) values are kept lazily in `[0, 2^256)`
+   (`2^256 ≡ 38`). Multiplication is one level of Karatsuba over 128-bit halves (48 partial products
+   instead of 64) with PTX carry chains, generated by `tools/gen_fe8.py`. On sm_120 this is 1.9x faster
+   than the radix-2^25.5 ref10 multiply; the hot loop is bound by the integer multiply pipe.
 
-1. **8-bit signed-digit comb** for fixed-base scalar multiplication. The 256-bit scalar splits into 32 signed bytes in `[-128, 128]`, each indexing a precomputed table `(j * 256^w * G)` for `j ∈ [1..128]`, `w ∈ [0..31]` (4096 points × 3 fe10 = 480 KB in device global memory, fits in L2 cache). One scalar mult = 32 mixed additions instead of 256 doublings + 256 conditional adds.
+3. **Batched inversion in a separate kernel.** `k_gen` writes projective `(X, Y, Z)` for a batch of 4M
+   keys; `k_inv` inverts 128 Zs per thread with Montgomery's trick (one inversion per 128 keys), computes
+   the public key and applies a cheap gate. `k_inv` is memory-bound and `k_gen` compute-bound, so `k_inv`
+   of batch n runs on a high-priority stream next to `k_gen` of batch n+1.
 
-2. **ref10 fe10** — field representation in radix-2^25.5 (10 signed i32 limbs alternating 26/25 bits). `fe_mul` does 100 partial products vs 256 in TweetNaCl 16x16, and uses `mad.wide.s32` (1-cycle Ampere instruction) instead of slow i64 multiplication.
+4. **Matching.** The address is the base58 form of the 256-bit integer `N` (key bytes, big-endian).
+   A suffix of length K fixes `N mod 58^K`, hence `N mod 2^K`: a 256-bit bitmap of allowed low bytes
+   rejects most keys. A prefix is a set of integer ranges of `N` (for 44- and 43-character addresses),
+   checked on the top 64 bits. Survivors go to `k_check`, which does the exact base58 compare.
 
-3. **Within-thread Montgomery batched inversion (N=4)** — each thread processes 4 candidates in parallel. Stage 1: four `scalarbase` calls saving `(X, Y, Z)` to local memory. Stage 2: forward prefix products + one `inv25519` + backward walk. One inversion is amortized across 4 candidates instead of 4 separate inversions. Saves ~75% of inversion cost.
-
-4. **Suffix mod-58^K prefilter** — after `pack25519` we compute `pubkey_int mod 58^K` (where K is the suffix length) and compare against a precomputed target. 99.99% of non-matching candidates skip the full base58 encode + match check.
-
-Hot path per pubkey:
-- SHA-512 → clamp → fast_scalarbase (32 madd) → batched inversion (1/4 of inv25519 amortized) → 2× fe_mul (X·invZ, Y·invZ) → pack25519 → mod-58^K check
-- ~25K cycles per pubkey effective. Measured 44M k/s = ~15% of theoretical peak. Bottleneck: register pressure (255 registers/thread = Ampere maximum → 8 warps/SM occupancy).
-
-Further optimization would require hand-tuned PTX/SASS or fundamental architectural rework.
+5. **Host check.** Every match is re-derived from its index on the CPU, the public key is recomputed with an
+   independent reference implementation (plain SHA-512 + Montgomery ladder, no tables) and the pattern
+   is re-checked before the key is written. A mismatch would be reported and the key dropped.
 
 ## Security
 
-- The starting seed mixes `rand()` (host) + `time(NULL)` (host) + `tid` (per thread). Not cryptographic randomness, but for a vanity grinder only the unpredictability of the starting point matters — the seed is then incremented as a 256-bit counter.
-- **If you need crypto-grade randomness for the starting seed** (e.g., a key holding long-term funds): replace `random_bytes()` in `vanity.cu` with reads from `/dev/urandom` (Linux) or `BCryptGenRandom` (Windows).
+- Seeds come from ChaCha12 keyed with 32 bytes from the OS RNG (`BCryptGenRandom` / `/dev/urandom`),
+  one key per run and GPU. Seeds are independent: giving away one generated key reveals nothing about the
+  others from the same run. (v1.0.0 seeded from `rand()` and `time()`; keys made with it should be
+  treated as weak and not hold funds.)
 - No network calls. No telemetry. All private keys stay on your machine.
-- The ed25519 implementation is a port of ref10 (the standard reference). Correctness verified against `ed25519-dalek`.
-- The `<suffix>_results.csv` file contains private keys in plaintext. **Never commit it.** Consider encrypting it after the run. The default `.gitignore` excludes `*_results.csv`.
+- `--selftest` checks GPU keys against the host reference (which itself is checked against RFC 8032)
+  and the GPU matcher against a full host scan, for every window size.
+- The results CSV contains private keys in plaintext. **Never commit it.** Consider encrypting it after the
+  run. The default `.gitignore` excludes `*_results.csv`.
 
 ## License
 
@@ -138,5 +167,8 @@ MIT. See `LICENSE`.
 
 ## Credits
 
-- **ed25519 ref10** by Daniel J. Bernstein, Niels Duif, Tanja Lange, Peter Schwabe, Bo-Yin Yang — public domain (via SUPERCOP). The field constants (`D`, `D2`) and the inversion addition chain are taken directly from ref10.
-- The 8-bit signed-digit comb structure for fixed-base scalar multiplication is a standard construction; see e.g. Hisil-Wong-Carter-Dawson "Twisted Edwards Curves Revisited" (2008) and the ed25519 paper.
+- **ed25519 ref10** by Daniel J. Bernstein, Niels Duif, Tanja Lange, Peter Schwabe, Bo-Yin Yang — public
+  domain (via SUPERCOP). Field constants and the inversion addition chain come from ref10.
+- Signed-digit fixed-base comb: standard construction; see Hisil–Wong–Carter–Dawson "Twisted Edwards
+  Curves Revisited" (2008) and the ed25519 paper.
+- ChaCha by Daniel J. Bernstein.

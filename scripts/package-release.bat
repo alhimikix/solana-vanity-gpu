@@ -28,7 +28,7 @@ if not exist "%VS_VCVARS%" (
 call "%VS_VCVARS%" >nul
 mkdir "%OUTDIR%" 2>nul
 
-for %%A in (75 86 89) do (
+for %%A in (75 86 89 120) do (
     echo Building sm_%%A...
     "%CUDA_HOME%\bin\nvcc.exe" -O3 -arch=sm_%%A -allow-unsupported-compiler -Xcompiler "/O2 /MD" -o "%OUTDIR%\vanity_gpu_sm%%A.exe" vanity.cu
     if errorlevel 1 (

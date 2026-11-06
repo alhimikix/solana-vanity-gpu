@@ -12,9 +12,9 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install CUDA Toolkit
-        uses: Jimver/cuda-toolkit@v0.2.16
+        uses: Jimver/cuda-toolkit@v0.2.36
         with:
-          cuda: '12.5.0'
+          cuda: '12.9.1'
           method: 'network'
           sub-packages: '["nvcc", "cudart"]'
 
@@ -38,12 +38,17 @@ jobs:
         run: |
           nvcc -O3 -arch=sm_75 -allow-unsupported-compiler -Xcompiler "/O2 /MD" -o vanity_gpu_sm75.exe vanity.cu
 
+      - name: Build (sm_120 — RTX 50xx)
+        shell: cmd
+        run: |
+          nvcc -O3 -arch=sm_120 -allow-unsupported-compiler -Xcompiler "/O2 /MD" -o vanity_gpu_sm120.exe vanity.cu
+
       - name: Package Windows release
         shell: pwsh
         run: |
           $version = "${{ github.ref_name }}"
           New-Item -ItemType Directory -Force -Path release-win
-          Copy-Item vanity_gpu_sm75.exe, vanity_gpu_sm86.exe, vanity_gpu_sm89.exe release-win/
+          Copy-Item vanity_gpu_sm75.exe, vanity_gpu_sm86.exe, vanity_gpu_sm89.exe, vanity_gpu_sm120.exe release-win/
           Copy-Item README.md, LICENSE, CHANGELOG.md release-win/
           Compress-Archive -Path release-win/* -DestinationPath "solana-vanity-gpu-$version-windows-x64.zip"
 
@@ -59,26 +64,29 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install CUDA Toolkit
-        uses: Jimver/cuda-toolkit@v0.2.16
+        uses: Jimver/cuda-toolkit@v0.2.36
         with:
-          cuda: '12.5.0'
+          cuda: '12.9.1'
           method: 'network'
           sub-packages: '["nvcc", "cudart"]'
 
       - name: Build (sm_86)
-        run: nvcc -O3 -arch=sm_86 -o vanity_gpu_sm86 vanity.cu
+        run: nvcc -O3 -arch=sm_86 -Xcompiler -pthread -o vanity_gpu_sm86 vanity.cu
 
       - name: Build (sm_89)
-        run: nvcc -O3 -arch=sm_89 -o vanity_gpu_sm89 vanity.cu
+        run: nvcc -O3 -arch=sm_89 -Xcompiler -pthread -o vanity_gpu_sm89 vanity.cu
 
       - name: Build (sm_75)
-        run: nvcc -O3 -arch=sm_75 -o vanity_gpu_sm75 vanity.cu
+        run: nvcc -O3 -arch=sm_75 -Xcompiler -pthread -o vanity_gpu_sm75 vanity.cu
+
+      - name: Build (sm_120)
+        run: nvcc -O3 -arch=sm_120 -Xcompiler -pthread -o vanity_gpu_sm120 vanity.cu
 
       - name: Package Linux release
         run: |
           version="${{ github.ref_name }}"
           mkdir -p release-linux
-          cp vanity_gpu_sm75 vanity_gpu_sm86 vanity_gpu_sm89 release-linux/
+          cp vanity_gpu_sm75 vanity_gpu_sm86 vanity_gpu_sm89 vanity_gpu_sm120 release-linux/
           cp README.md LICENSE CHANGELOG.md release-linux/
           tar -czf "solana-vanity-gpu-${version}-linux-x64.tar.gz" -C release-linux .
 
