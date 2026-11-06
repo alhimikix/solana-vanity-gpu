@@ -5,6 +5,7 @@ const $ = (id) => document.getElementById(id);
 const form = $("form"), startBtn = $("start"), stopBtn = $("stop"), hint = $("hint");
 const screen = $("screen"), log = $("log"), progress = $("progress");
 let grinder = null, running = false;
+const session = [];   // every key found on this page: { address, secret, seed, pk }
 
 const fmtN = (n) => n >= 1e12 ? (n / 1e12).toFixed(2) + "T" : n >= 1e9 ? (n / 1e9).toFixed(2) + "G" : n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : String(Math.round(n));
 function fmtT(s) {
@@ -51,16 +52,21 @@ const COMMANDS = {
     demo: () => { echo("vanity --demo"); print("t-demo"); },
     how: () => { echo("cat HOW.md"); print("t-how"); },
     selftest: () => runSelftest(),
+    save: () => {
+        echo("vanity --save-all");
+        if (!session.length) { line("nothing found yet", "dim"); return; }
+        saveLine(session, "session");
+    },
     clear: () => { if (!running) { log.replaceChildren(); progress.textContent = ""; } },
 };
 document.querySelectorAll("[data-cmd]").forEach((b) => b.addEventListener("click", () => COMMANDS[b.dataset.cmd]()));
 // Alt+1..7 like the key bar
-const KEYS = ["about", "download", "demo", "how", "selftest", "clear"];
+const KEYS = ["about", "download", "demo", "how", "selftest", "save", "clear"];
 document.addEventListener("keydown", (e) => {
     if (!e.altKey || e.ctrlKey || e.metaKey) return;
     const n = Number(e.key);
-    if (n >= 1 && n <= 6) { e.preventDefault(); COMMANDS[KEYS[n - 1]](); }
-    else if (n === 7) { e.preventDefault(); location.href = "https://github.com/alhimikix/solana-vanity-gpu"; }
+    if (n >= 1 && n <= 7) { e.preventDefault(); COMMANDS[KEYS[n - 1]](); }
+    else if (n === 8) { e.preventDefault(); location.href = "https://github.com/alhimikix/solana-vanity-gpu"; }
 });
 
 // "try:" links inside the about text fill the prompt and run it
@@ -105,6 +111,30 @@ async function copy(text, btn) {
     const old = btn.textContent;
     btn.textContent = "[copied]";
     setTimeout(() => (btn.textContent = old), 1200);
+}
+
+// ---------- export ----------
+function download(name, text, type) {
+    const url = URL.createObjectURL(new Blob([text], { type }));
+    const el = document.createElement("a");
+    el.href = url; el.download = name; el.click();
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+function toCsv(list) {   // same format as the native app
+    return "public_key,private_key\n" + list.map((m) => `${m.address},${m.secret}`).join("\n") + "\n";
+}
+function toJson(list) {
+    return JSON.stringify(list.map((m) => ({ publicKey: m.address, privateKey: m.secret, keypair: [...m.seed, ...m.pk] })), null, 1);
+}
+function saveLine(list, tag) {
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
+    const d = line("");
+    d.textContent = "";
+    const t = document.createElement("span");
+    t.className = "dim"; t.textContent = `save ${list.length} keypair${list.length > 1 ? "s" : ""}: `;
+    d.append(t,
+        act("csv", () => download(`vanity-${tag}-${stamp}.csv`, toCsv(list), "text/csv")),
+        act("json", () => download(`vanity-${tag}-${stamp}.json`, toJson(list), "application/json")));
 }
 
 function addFound(m, n, prefix, suffix) {
@@ -167,6 +197,7 @@ form.addEventListener("submit", async (e) => {
         line(`Odds:     1 in ${(1 / pats.prob).toPrecision(4)} keys per match`, "y");
         line("");
         let got = 0, sinceFind = 0, prevKeys = 0, last = null, frame = 0;
+        const run = [];
         const t0 = performance.now();
         const SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
         timer = setInterval(() => {
@@ -182,6 +213,7 @@ form.addEventListener("submit", async (e) => {
             onMatch: (m) => {
                 if (count && got >= count) return;
                 got++; sinceFind = 0;
+                run.push(m); session.push(m);
                 addFound(m, got, prefix, suffix);
                 if (count && got >= count) g.stop();
             },
@@ -190,7 +222,10 @@ form.addEventListener("submit", async (e) => {
         });
         clearInterval(timer);
         progress.textContent = "";
-        line(`Done. ${got} keypairs in ${((performance.now() - t0) / 1000).toFixed(2)}s (${fmtN(last ? last.avg : 0)} keys/sec average).`, "done");
+        const secs = (performance.now() - t0) / 1000;
+        // very short runs are dominated by start-up latency, so the average would understate the speed
+        line(`Done. ${got} keypairs in ${secs.toFixed(2)}s` + (secs > 3 && last ? ` (${fmtN(last.avg)} keys/sec average).` : "."), "done");
+        if (run.length) saveLine(run, [prefix, suffix].filter(Boolean).join("-"));
     } catch (err) {
         if (timer) clearInterval(timer);
         progress.textContent = "";

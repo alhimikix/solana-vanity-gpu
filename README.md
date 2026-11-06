@@ -9,7 +9,7 @@ starts and/or ends with what you want. Several patterns can be searched at once,
 https://github.com/user-attachments/assets/e398972d-8331-4d56-8764-61573bc38220
 
 **Try it in the browser:** https://alhimikix.github.io/solana-vanity-gpu/ — the same pipeline ported to
-WebGPU (~138M keys/sec on an RTX 5080, Chrome/Edge). Keys are generated and checked on the page only.
+WebGPU (~145M keys/sec on an RTX 5080 in Chrome, ~110M in Firefox). Keys are generated and checked on the page only.
 
 ## Requirements
 

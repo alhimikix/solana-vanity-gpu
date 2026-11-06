@@ -252,7 +252,7 @@ fn load_fe(e: u32, slot: u32) -> Fe {
     return fe_unpack(w);
 }
 
-@compute @workgroup_size(64)
+@compute @workgroup_size(128)
 fn gen_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     if (i >= P.nk) { return; }

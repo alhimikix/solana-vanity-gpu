@@ -6,7 +6,9 @@ const MATCH_CAP = 4096;
 const REC = 12;   // u32 per match record: idx, pattern, pk[8], pad[2]
 
 export class Grinder {
-    static async create({ gpu = globalThis.navigator?.gpu, W = 14, logNK = 20, mc = 64, dump = false } = {}) {
+    // logNK: starting batch size; maxLogNK: the batch doubles while a batch takes < 100 ms on average
+    // (browsers add per-batch latency, so fast GPUs need big batches; slow ones must keep them small).
+    static async create({ gpu = globalThis.navigator?.gpu, W = 14, logNK = 20, maxLogNK = 22, mc = 64, dump = false } = {}) {
         if (!gpu) throw new Error("WebGPU is not available in this browser");
         const adapter = await gpu.requestAdapter({ powerPreference: "high-performance" });
         if (!adapter) throw new Error("No WebGPU adapter found");
@@ -19,9 +21,15 @@ export class Grinder {
         });
         const g = new Grinder();
         g.adapter = adapter; g.device = device;
+        // any validation / out-of-memory error must stop the run, never be skipped silently
+        device.addEventListener("uncapturederror", (ev) => { g.gpuError = ev.error?.message || String(ev.error); });
+        device.lost.then((info) => { g.gpuError = g.gpuError || `GPU device lost: ${info.message || info.reason}`; });
         g.info = adapter.info || {};
         g.cfg = combCfg(W);
-        g.nk = 1 << logNK; g.mc = mc; g.nthreads = g.nk / mc;
+        const lim = Math.min(adapter.limits.maxStorageBufferBindingSize, adapter.limits.maxBufferSize);
+        const maxGroups = adapter.limits.maxComputeWorkgroupsPerDimension;   // 65535 by default
+        while (maxLogNK > logNK && ((1 << maxLogNK) * 32 > lim || (1 << maxLogNK) / 128 > maxGroups)) maxLogNK--;
+        g.nk = 1 << logNK; g.capNK = 1 << Math.max(logNK, maxLogNK); g.mc = mc;
         g.dumpMode = dump;
         await g._init();
         return g;
@@ -74,7 +82,7 @@ export class Grinder {
         this.tableMs = performance.now() - t0;
 
         // ---- buffers ----
-        const fe = this.nk * 32, ST = GPUBufferUsage.STORAGE;
+        const fe = this.capNK * 32, ST = GPUBufferUsage.STORAGE;
         this.X = this._buf(fe, ST); this.Y = this._buf(fe, ST); this.Z = this._buf(fe, ST); this.Pf = this._buf(fe, ST);
         this.params = this._buf(112, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
         this.outBytes = (4 + MATCH_CAP * REC) * 4;
@@ -124,28 +132,28 @@ export class Grinder {
         return pats;
     }
 
-    _writeParams(base) {
+    _writeParams(base, nk) {
         const u = new Uint32Array(28);
         u.set(this.key, 0);
         u.set(this.pats.bitmap, 8);
-        u[16] = Number(base & 0xffffffffn); u[17] = Number(base >> 32n); u[18] = this.nonce; u[19] = this.nk;
-        u[20] = this.nthreads; u[21] = this.mc; u[22] = this.pats.list.length; u[23] = this.pats.icase ? 1 : 0;
+        u[16] = Number(base & 0xffffffffn); u[17] = Number(base >> 32n); u[18] = this.nonce; u[19] = nk;
+        u[20] = nk / this.mc; u[21] = this.mc; u[22] = this.pats.list.length; u[23] = this.pats.icase ? 1 : 0;
         u[24] = this.pats.ranges.length; u[25] = MATCH_CAP; u[26] = this.dumpMode ? 1 : 0; u[27] = 0;
         this.device.queue.writeBuffer(this.params, 0, u);
     }
 
     // Enqueue one batch; resolves with { base, count, records } once results are readable.
     _batch() {
-        const d = this.device, base = this.next;
-        this.next += BigInt(this.nk);
-        this._writeParams(base);
+        const d = this.device, base = this.next, nk = this.nk;
+        this.next += BigInt(nk);
+        this._writeParams(base, nk);
         d.queue.writeBuffer(this.out, 0, new Uint32Array(4));
         const staging = d.createBuffer({ size: this.outBytes, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
         const enc = d.createCommandEncoder();
         let p = enc.beginComputePass();
-        p.setPipeline(this.genPipe); p.setBindGroup(0, this.bg); p.dispatchWorkgroups(Math.ceil(this.nk / 64)); p.end();
+        p.setPipeline(this.genPipe); p.setBindGroup(0, this.bg); p.dispatchWorkgroups(Math.ceil(nk / 128)); p.end();
         p = enc.beginComputePass();
-        p.setPipeline(this.invPipe); p.setBindGroup(0, this.bg); p.dispatchWorkgroups(Math.ceil(this.nthreads / 64)); p.end();
+        p.setPipeline(this.invPipe); p.setBindGroup(0, this.bg); p.dispatchWorkgroups(Math.ceil(nk / this.mc / 64)); p.end();
         enc.copyBufferToBuffer(this.out, 0, staging, 0, this.outBytes);
         d.queue.submit([enc.finish()]);
         return staging.mapAsync(GPUMapMode.READ).then(() => {
@@ -156,7 +164,7 @@ export class Grinder {
                 const o = 4 + s * REC;
                 records.push({ idx: a[o], pat: a[o + 1], pk: a.slice(o + 2, o + 10) });
             }
-            return { base, count: a[0], records };
+            return { base, nk, count: a[0], records };
         });
     }
 
@@ -183,7 +191,8 @@ export class Grinder {
             while (this.running || queue.length) {
                 while (this.running && queue.length < inflight) queue.push(this._batch());
                 const r = await queue.shift();
-                keys += this.nk;
+                if (this.gpuError) throw new Error(this.gpuError);
+                keys += r.nk;
                 for (const rec of r.records) {
                     const m = await this.verify(r.base, rec);
                     if (m) onMatch?.(m); else mismatch++;
@@ -193,6 +202,8 @@ export class Grinder {
                     const avg = (keys * 1000) / (now - t0);
                     // batches finishing back-to-back at the end would show a fake spike: report the average then
                     const rate = this.running ? ((keys - lastK) * 1000) / (now - lastT) : avg;
+                    // wall time per batch bounds its GPU time from above: keep batches well under the driver watchdog
+                    if (this.running && this.nk < this.capNK && (this.nk / rate) * 1000 < 100) this.nk *= 2;
                     onStats?.({ keys, rate, avg, mismatch, dropped: r.count > MATCH_CAP });
                     lastT = now; lastK = keys;
                 }
@@ -228,7 +239,7 @@ export async function selftest({ gpu, W = 14 } = {}) {
     const got = [...(await R.pubkeyFromSeed(seed))].map((b) => b.toString(16).padStart(2, "0")).join("");
     lines.push(`${got === want ? "ok  " : "FAIL"} reference vs RFC 8032`); ok &&= got === want;
 
-    const g = await Grinder.create({ gpu, W, logNK: 16, mc: 32, dump: true });
+    const g = await Grinder.create({ gpu, W, logNK: 16, maxLogNK: 16, mc: 32, dump: true });
     const list = [{ suffix: "Ab" }, { prefix: "Bc" }, { prefix: "9", suffix: "z" }, { prefix: "x" }];
     g.setPatterns(list, true);
     const r = await g._batch();
