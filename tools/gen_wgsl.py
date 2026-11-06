@@ -1,0 +1,119 @@
+# Emits WGSL for GF(2^255-19) on 20 x 13-bit limbs (u32), used by the browser (WebGPU) grinder.
+#
+# Representation: value = sum r[i] * 2^(13 i). After fe_norm every limb is < 2^13 (+ a tiny carry on
+# limb 1) and limb 19 keeps 8 bits, so values are < 2^255 + small. Multiplication is product
+# scanning: a column holds at most 20 products < 2^26.1, so it never overflows a u32. Columns 20..38
+# (weight 2^260 and up) are folded back with 2^260 = 608 (mod p).
+#
+# Usage: python tools/gen_wgsl.py > web/js/fe13.wgsl.js
+N, B, M = 20, 13, (1 << 13) - 1
+P = (1 << 255) - 19
+
+
+def norm_lines(r, indent="    "):
+    L = ["var c: u32 = 0u;"]
+    for i in range(N - 1):
+        L += [f"{r}[{i}] += c; c = {r}[{i}] >> 13u; {r}[{i}] &= 0x1fffu;"]
+    L += [f"{r}[19] += c; c = {r}[19] >> 8u; {r}[19] &= 0xffu;",
+          f"{r}[0] += 19u * c; c = {r}[0] >> 13u; {r}[0] &= 0x1fffu; {r}[1] += c;"]
+    return [indent + l for l in L]
+
+
+def mul(square=False):
+    name = "fe_sq" if square else "fe_mul"
+    sig = "(a: Fe) -> Fe" if square else "(a: Fe, b: Fe) -> Fe"
+    L = [f"fn {name}{sig} {{", "    var r: Fe;", "    var c: u32 = 0u;", "    var t: u32;", "    var h: u32;"]
+    for k in range(2 * N - 1):
+        terms = []
+        for i in range(max(0, k - N + 1), min(k, N - 1) + 1):
+            j = k - i
+            if square:
+                if i > j: continue
+                terms.append(f"a[{i}] * a[{j}]" if i == j else f"2u * (a[{i}] * a[{j}])")
+            else:
+                terms.append(f"a[{i}] * b[{j}]")
+        L.append(f"    t = c + " + " + ".join(terms) + ";")
+        if k < N:
+            L.append(f"    r[{k}] = t & 0x1fffu; c = t >> 13u;")
+        else:
+            L.append(f"    h = t & 0x1fffu; c = t >> 13u; r[{k - N}] += 608u * h;")
+    # remaining carry has weight 2^(13*39) = 2^247 * 2^260 -> 608 at limb 19
+    L.append("    r[19] += 608u * c;")
+    # normalise (fold at 2^255)
+    L += [l.replace("var c: u32 = 0u;", "c = 0u;") for l in norm_lines("r")]
+    L += ["    return r;", "}"]
+    return L
+
+
+def sub_const():
+    # 8p written with every limb >= 2^13 + 256 (limb 19 >= 600), so a + K - b never underflows
+    # for a normalised b (limbs < 2^13 + small, limb 19 < 2^8 + small).
+    v = 8 * P
+    d = [(v >> (B * i)) & M for i in range(N)]
+    d[19] = v >> (B * 19)
+    for i in range(N - 1):
+        d[i] += 2 << B
+        d[i + 1] -= 2
+    assert sum(x << (B * i) for i, x in enumerate(d)) == v
+    assert all(x >= (1 << B) + 256 for x in d[:19]) and d[19] >= 600, d
+    return d
+
+
+def pack():
+    # exact 256-bit value after fe_carry -> 8 little-endian u32
+    L = ["fn fe_pack(a0: Fe) -> array<u32, 8> {", "    let a = fe_carry(a0);", "    var w: array<u32, 8>;"]
+    for k in range(8):
+        parts = []
+        for i in range(N):
+            lo, hi = B * i, B * i + B
+            if hi <= 32 * k or lo >= 32 * k + 32: continue
+            sh = lo - 32 * k
+            parts.append(f"(a[{i}] << {sh}u)" if sh >= 0 else f"(a[{i}] >> {-sh}u)")
+        L.append(f"    w[{k}] = " + " | ".join(parts) + ";")
+    L += ["    return w;", "}"]
+    return L
+
+
+def unpack():
+    L = ["fn fe_unpack(w: array<u32, 8>) -> Fe {", "    var r: Fe;"]
+    for i in range(N):
+        lo = B * i
+        k, sh = lo // 32, lo % 32
+        width = 9 if i == 19 else B
+        expr = f"(w[{k}] >> {sh}u)"
+        if sh + width > 32 and k + 1 < 8:
+            expr = f"((w[{k}] >> {sh}u) | (w[{k + 1}] << {32 - sh}u))"
+        mask = (1 << width) - 1
+        L.append(f"    r[{i}] = {expr} & {hex(mask)}u;")
+    L += ["    return r;", "}"]
+    return L
+
+
+def main():
+    K = sub_const()
+    out = []
+    out.append("alias Fe = array<u32, 20>;")
+    out.append("const FE_SUBK = Fe(" + ", ".join(f"{x}u" for x in K) + ");")
+    d2 = (2 * (-121665 * pow(121666, P - 2, P))) % P
+    out.append("const FE_D2 = Fe(" + ", ".join(f"{(d2 >> (B * i)) & M}u" for i in range(N)) + ");")
+    out.append("fn fe_norm(a: Fe) -> Fe {\n    var r = a;\n" + "\n".join(norm_lines("r")) + "\n    return r;\n}")
+    out.append("fn fe_add(a: Fe, b: Fe) -> Fe {\n    var r: Fe;\n"
+               + "\n".join(f"    r[{i}] = a[{i}] + b[{i}];" for i in range(N)) + "\n    return fe_norm(r);\n}")
+    out.append("fn fe_sub(a: Fe, b: Fe) -> Fe {\n    var r: Fe;\n"
+               + "\n".join(f"    r[{i}] = a[{i}] + FE_SUBK[{i}] - b[{i}];" for i in range(N)) + "\n    return fe_norm(r);\n}")
+    # exact carry: limbs 0..18 < 2^13, limb 19 < 2^9 (value < 2^256), lossless for fe_pack
+    out.append("fn fe_carry(a: Fe) -> Fe {\n    var r = fe_norm(a);\n    var c: u32 = 0u;\n"
+               + "\n".join(f"    r[{i}] += c; c = r[{i}] >> 13u; r[{i}] &= 0x1fffu;" for i in range(N - 1))
+               + "\n    r[19] += c;\n    return r;\n}")
+    out.append("\n".join(mul(False)))
+    out.append("\n".join(mul(True)))
+    out.append("\n".join(pack()))
+    out.append("\n".join(unpack()))
+    body = "\n\n".join(out)
+    print("// Generated by tools/gen_wgsl.py - do not edit.")
+    print("export const FE13_WGSL = `")
+    print(body)
+    print("`;")
+
+
+main()

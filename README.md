@@ -6,11 +6,10 @@ starts and/or ends with what you want. Several patterns can be searched at once,
 **~410M keys/sec on an RTX 5080** (the v1.0.0 kernel does 67–70M on the same card). Keys are standard
 32-byte seeds, so they import into Phantom, Solflare and `solana-keygen` as usual.
 
-
-
 https://github.com/user-attachments/assets/e398972d-8331-4d56-8764-61573bc38220
 
-
+**Try it in the browser:** https://alhimikix.github.io/solana-vanity-gpu/ — the same pipeline ported to
+WebGPU (~138M keys/sec on an RTX 5080, Chrome/Edge). Keys are generated and checked on the page only.
 
 ## Requirements
 
@@ -154,6 +153,14 @@ batched inversion → `y` and the sign of `x` → pattern check.
 5. **Host check.** Every match is re-derived from its index on the CPU, the public key is recomputed with an
    independent reference implementation (plain SHA-512 + Montgomery ladder, no tables) and the pattern
    is re-checked before the key is written. A mismatch would be reported and the key dropped.
+
+## Browser version (`web/`)
+
+A static page that runs the grinder on the GPU through WebGPU: same seeds (ChaCha12), same comb and
+batched inversion, field arithmetic on 20 × 13-bit limbs in WGSL (`tools/gen_wgsl.py` generates it, since
+WGSL has no 64-bit integers or high multiply). Every match is recomputed with a plain BigInt ed25519 before
+it is shown. The page makes no network requests after loading. Deployed to GitHub Pages by
+`.github/workflows/pages.yml`; to run locally: `python -m http.server -d web` and open http://localhost:8000.
 
 ## Security
 

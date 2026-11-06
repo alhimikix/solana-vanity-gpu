@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>solana-vanity-gpu — Solana vanity addresses at GPU speed</title>
+<meta name="description" content="Generate Solana vanity addresses on your GPU: prefix, suffix or both. Native CUDA ~410M keys/s, in the browser with WebGPU. Keys never leave your machine.">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src 'self'; img-src 'self' data:; media-src 'self'; style-src 'self'; script-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="term">
+  <div class="bar">
+    <i></i><i></i><i></i>
+    <span id="gputitle" class="title">solana-vanity-gpu v2.0.0 — ~&#92;vanity</span>
+    <nav class="menu">
+      <button type="button" data-cmd="about">about</button>
+      <button type="button" data-cmd="download">download</button>
+      <button type="button" data-cmd="demo">demo</button>
+      <button type="button" data-cmd="how">how</button>
+      <button type="button" data-cmd="selftest">selftest</button>
+      <button type="button" data-cmd="clear">clear</button>
+      <a href="https://github.com/alhimikix/solana-vanity-gpu">github ↗</a>
+    </nav>
+  </div>
+
+  <div id="screen" class="screen">
+    <div id="log" class="log"></div>
+    <div id="progress"></div>
+  </div>
+
+  <form id="form" class="prompt" autocomplete="off">
+    <span class="ps">PS ~&#92;vanity&gt;</span>
+    <span>vanity</span>
+    <label><span class="flag">-p</span><input id="prefix" placeholder="prefix" maxlength="12" spellcheck="false"></label>
+    <label><span class="flag">-s</span><input id="suffix" placeholder="suffix" maxlength="12" spellcheck="false"></label>
+    <label><span class="flag">-n</span><select id="count"><option>1</option><option>3</option><option selected>5</option><option>10</option><option value="0">∞</option></select></label>
+    <label class="chk"><input type="checkbox" id="icase"><span class="flag">-i</span><span class="dim">any case</span></label>
+    <button id="start" type="submit">⏎ run</button>
+    <button id="stop" type="button" disabled>■ stop</button>
+    <div id="hint" class="dim"></div>
+  </form>
+</div>
+
+<template id="t-about">
+<pre class="logo" aria-label="vanity">██╗   ██╗ █████╗ ███╗   ██╗██╗████████╗██╗   ██╗
+██║   ██║██╔══██╗████╗  ██║██║╚══██╔══╝╚██╗ ██╔╝
+██║   ██║███████║██╔██╗ ██║██║   ██║    ╚████╔╝
+╚██╗ ██╔╝██╔══██║██║╚██╗██║██║   ██║     ╚██╔╝
+ ╚████╔╝ ██║  ██║██║ ╚████║██║   ██║      ██║
+  ╚═══╝  ╚═╝  ╚═╝╚═╝  ╚═══╝╚═╝   ╚═╝      ╚═╝</pre>
+<div><b>Solana vanity addresses at <span class="g">GPU speed</span></b></div>
+<div class="dim">Pick how your address starts (-p), ends (-s), or both, and hit run. It runs on your graphics card;</div>
+<div class="dim">keys are created and checked on this page only — nothing is sent anywhere.</div>
+<div class="sp"></div>
+<div class="dim"># keys/sec on an RTX 5080</div>
+<pre class="bars"><span class="dim">v1.0.0  native  </span><span class="b1">████</span><span class="b0">██████████████████████████</span>  <span class="txt"> 70M</span>
+<span class="dim">browser WebGPU  </span><span class="b2">██████████</span><span class="b0">████████████████████</span>  <span class="g">138M</span>  <span class="dim">← this page</span>
+<span class="dim">v2.0.0  native  </span><span class="b3">██████████████████████████████</span>  <span class="y">410M</span>  <span class="dim">← download</span></pre>
+<div class="sp"></div>
+<div class="dim">try: <a href="#" data-try="pump|">-s pump</a> · <a href="#" data-try="|Anton">-p Anton</a> · <a href="#" data-try="pump|So|i">-p So -s pump -i</a></div>
+</template>
+
+<template id="t-download">
+<div class="dim">Native app: ~3× faster than the browser, runs in the background, several patterns and GPUs at once.</div>
+<div>  <a href="https://github.com/alhimikix/solana-vanity-gpu/releases/download/v2.0.0/solana-vanity-gpu-v2.0.0-windows-x64.zip">↓ solana-vanity-gpu-v2.0.0-windows-x64.zip</a></div>
+<div>  <a href="https://github.com/alhimikix/solana-vanity-gpu/releases/download/v2.0.0/solana-vanity-gpu-v2.0.0-linux-x64.tar.gz">↓ solana-vanity-gpu-v2.0.0-linux-x64.tar.gz</a></div>
+<div>  <a href="https://github.com/alhimikix/solana-vanity-gpu/releases">→ all releases</a></div>
+<div class="dim"># NVIDIA RTX 20xx or newer. One binary per GPU: sm75 RTX 20xx/GTX 16xx · sm86 RTX 30xx · sm89 RTX 40xx · sm120 RTX 50xx</div>
+<pre><span class="txt">  vanity_gpu_sm120.exe -s pump -n 10</span>        <span class="dim"># ends with pump, 10 addresses</span>
+<span class="txt">  vanity_gpu_sm120.exe -p Anton -n 1</span>        <span class="dim"># starts with Anton</span>
+<span class="txt">  vanity_gpu_sm120.exe -m "So*pump" -i</span>      <span class="dim"># So… and …pump, any case</span>
+<span class="txt">  vanity_gpu_sm120.exe --selftest</span>           <span class="dim"># check the GPU against the reference</span></pre>
+</template>
+
+<template id="t-demo">
+<video class="demo" src="demo.mp4" controls muted autoplay loop playsinline preload="metadata"></video>
+<div class="dim"># native app on an RTX 5080: pump and Anton… instantly, …Solana ~5 s each, the 7-letter …Phantom in 33 s</div>
+</template>
+
+<template id="t-how">
+<pre><span class="c">seeds    </span><span class="dim">a random 32-byte key from your crypto RNG feeds ChaCha12; seed i is its block i,
+         so sharing one generated key reveals nothing about the others</span>
+<span class="c">keys     </span><span class="dim">SHA-512 → clamp → fixed-base comb over a table of 14–16-bit signed windows,
+         one field inversion per 64–128 keys (Montgomery's trick)</span>
+<span class="c">matching </span><span class="dim">cheap filter on the key's low byte and top bits, then exact base58 on the GPU</span>
+<span class="c">checking </span><span class="dim">every match is recomputed with a separate, plain ed25519 before it is shown</span>
+<span class="c">odds     </span><span class="dim">each extra character is ~58× rarer; a prefix starting with J…z fits only
+         43-character addresses (~17× rarer); -i (any case) helps a lot</span>
+<span class="c">import   </span><span class="dim">Phantom / Solflare → Add wallet → Import private key; Solana CLI: use the .json</span>
+<span class="c">safety   </span><span class="dim">for an address that will hold real money, use the native app on an offline machine</span>
+<span class="c">license  </span><span class="dim">Apache 2.0 · © 2026 alhimikix</span></pre>
+</template>
+
+<script type="module" src="js/app.js"></script>
+</body>
+</html>
