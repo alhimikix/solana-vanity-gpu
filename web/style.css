@@ -104,16 +104,18 @@ b { font-weight: 700; font-size: 1.15em; }
 
 @media (max-width: 760px) {
   body { font-size: 12px; }
-  .prompt { font-size: 13px; gap: 2px 10px; }
+  /* the visible area, not 100vh (which includes the space under the browser toolbars) */
+  .term { inset: auto; top: 0; left: 0; right: 0; height: 100vh; height: 100dvh; border-radius: 0; border: 0; }
+  .bar .title { display: none; }
+  .screen { padding: 12px; }
+  .prompt { padding: 10px 12px 6px; font-size: 14px; gap: 2px 10px; }
   .prompt input:not([type=checkbox]) { width: 9ch; }
   .prompt .chk .dim { display: none; }
   #hint:not(.err) { display: none; }
-  .keys { flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; white-space: nowrap; }
-  .keys::-webkit-scrollbar { display: none; }
-  .keys button, .keys a { flex: none; }
-  .term { inset: 0; border-radius: 0; }
-  .bar .title { display: none; }
-  .keys { padding: 6px 12px 8px; font-size: 12px; gap: 2px 10px; }
-  .screen { padding: 12px; }
-  .prompt { padding: 10px 12px 6px; font-size: 14px; }
+  /* all commands visible as finger-sized keys, kept clear of the home indicator / browser bar */
+  .keys { flex-wrap: wrap; gap: 6px; font-size: 12px;
+    padding: 8px 10px calc(14px + env(safe-area-inset-bottom)); }
+  .keys button, .keys a { flex: 1 1 auto; justify-content: center; min-height: 34px; padding: 4px 6px;
+    background: #0d1117; border: 1px solid #263040; border-radius: 6px; touch-action: manipulation; }
+  .keys kbd { margin-right: 5px; }
 }
