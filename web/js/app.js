@@ -54,6 +54,14 @@ const COMMANDS = {
     clear: () => { if (!running) { log.replaceChildren(); progress.textContent = ""; } },
 };
 document.querySelectorAll("[data-cmd]").forEach((b) => b.addEventListener("click", () => COMMANDS[b.dataset.cmd]()));
+// Alt+1..7 like the key bar
+const KEYS = ["about", "download", "demo", "how", "selftest", "clear"];
+document.addEventListener("keydown", (e) => {
+    if (!e.altKey || e.ctrlKey || e.metaKey) return;
+    const n = Number(e.key);
+    if (n >= 1 && n <= 6) { e.preventDefault(); COMMANDS[KEYS[n - 1]](); }
+    else if (n === 7) { e.preventDefault(); location.href = "https://github.com/alhimikix/solana-vanity-gpu"; }
+});
 
 // "try:" links inside the about text fill the prompt and run it
 log.addEventListener("click", (e) => {
