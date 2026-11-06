@@ -45,9 +45,57 @@ function print(templateId) {
     screen.scrollTop = screen.scrollHeight;
 }
 
-// ---------- commands from the title bar ----------
+// ---------- speed bars: RTX 5080 references + this device, if measured ----------
+const MY_KEY = "vanity.myDevice";
+const loadMine = () => { try { return JSON.parse(localStorage.getItem(MY_KEY)); } catch { return null; } };
+function barRows() {
+    const rows = [
+        { label: "v1.0.0  native ", sub: "RTX 5080", v: 70e6, cls: "b1" },
+        { label: "browser WebGPU ", sub: "RTX 5080", v: 145e6, cls: "b2" },
+        { label: "v2.0.0  native ", sub: "RTX 5080", v: 410e6, cls: "b3" },
+    ];
+    const mine = loadMine();
+    if (mine) rows.unshift({ label: "YOUR DEVICE    ", sub: mine.name, v: mine.rate, cls: "b4", mine: true });
+    return rows;
+}
+function renderBars(slot) {
+    const rows = barRows();
+    const ch = (parseFloat(getComputedStyle(slot).fontSize) || 15) * 0.6;
+    const cols = Math.floor(slot.clientWidth / ch) || 60;
+    const wide = cols >= 64;                                   // room for the "RTX 5080" column
+    const width = Math.max(6, Math.min(30, cols - 15 - 6 - (wide ? 13 : 1)));
+    const max = Math.max(...rows.map((r) => r.v));
+    const fmtV = (v) => (v >= 1e8 ? (v / 1e6).toFixed(0) : (v / 1e6).toFixed(1)) + "M";
+    const pre = document.createElement("pre");
+    pre.className = "bars";
+    rows.forEach((r, i) => {
+        const n = Math.max(1, Math.round((r.v / max) * width));
+        const lab = document.createElement("span"); lab.className = r.mine ? "you" : "dim"; lab.textContent = r.label;
+        const on = document.createElement("span"); on.className = r.cls; on.textContent = "█".repeat(n);
+        const off = document.createElement("span"); off.className = "b0"; off.textContent = "█".repeat(width - n);
+        const val = document.createElement("span"); val.className = r.mine ? "you" : "txt"; val.textContent = " " + fmtV(r.v).padStart(5);
+        pre.append(lab, on, off, val);
+        if (wide) {
+            const sub = document.createElement("span"); sub.className = "dim"; sub.textContent = "  " + (r.mine ? "← " : "") + r.sub;
+            pre.append(sub);
+        }
+        if (i < rows.length - 1) pre.append("\n");
+    });
+    const mine = rows.find((r) => r.mine);
+    const out = [pre];
+    if (mine && !wide) {
+        const d = document.createElement("div"); d.className = "dim"; d.textContent = "YOUR DEVICE = " + mine.sub;
+        out.push(d);
+    }
+    slot.replaceChildren(...out);
+}
+const refreshBars = () => document.querySelectorAll(".bars-slot").forEach(renderBars);
+addEventListener("resize", refreshBars);
+
+// ---------- commands ----------
 const COMMANDS = {
-    about: () => { echo("vanity --about"); print("t-about"); },
+    about: () => { echo("vanity --about"); print("t-about"); refreshBars(); },
+    bench: () => runBench(),
     download: () => { echo("vanity --download"); print("t-download"); },
     demo: () => { echo("vanity --demo"); print("t-demo"); },
     how: () => { echo("cat HOW.md"); print("t-how"); },
@@ -69,8 +117,10 @@ document.addEventListener("keydown", (e) => {
     else if (n === 8) { e.preventDefault(); location.href = "https://github.com/alhimikix/solana-vanity-gpu"; }
 });
 
-// "try:" links inside the about text fill the prompt and run it
+// "try:" links inside the about text fill the prompt and run it; buttons printed into the log run commands
 log.addEventListener("click", (e) => {
+    const c = e.target.closest("[data-cmd]");
+    if (c) { e.preventDefault(); COMMANDS[c.dataset.cmd](); return; }
     const t = e.target.closest("[data-try]");
     if (!t) return;
     e.preventDefault();
@@ -176,6 +226,7 @@ async function getGrinder() {
     const t = performance.now();
     grinder = await Grinder.create({ W: 14, logNK: 20, mc: 64 });
     const gpuName = [grinder.info.vendor, grinder.info.architecture, grinder.info.description].filter(Boolean).join(" ") || "GPU";
+    grinder.gpuName = gpuName;
     $("gputitle").textContent = `solana-vanity-gpu v2.0.0 — ~\\vanity — WebGPU: ${gpuName}`;
     line(`GPU:      ${gpuName} (WebGPU)`, "dim");
     line(`          comb W=${grinder.cfg.w}: ${grinder.cfg.nwin} windows, table ${(grinder.cfg.entries * 96 / 1048576).toFixed(1)} MB, ready in ${((performance.now() - t) / 1000).toFixed(1)}s`, "dim");
@@ -236,6 +287,53 @@ form.addEventListener("submit", async (e) => {
 });
 
 stopBtn.addEventListener("click", () => { grinder?.stop(); });
+
+// Measure this device: ~10 s on a pattern that practically never matches.
+async function runBench() {
+    if (running) return;
+    if (!navigator.gpu) { echo("vanity --bench"); line("no WebGPU in this browser — try Chrome or Edge", "r"); return; }
+    running = true; startBtn.disabled = true;
+    echo("vanity --bench");
+    let timer = null;
+    try {
+        const g = await getGrinder();
+        g.setPatterns([{ suffix: "zzzzzzzzzz" }], false);
+        const windows = [], SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏", t0 = performance.now(), SECS = 10;
+        let frame = 0, last = null;
+        timer = setInterval(() => {
+            const el = (performance.now() - t0) / 1000;
+            progress.textContent = `${SPIN[frame++ % SPIN.length]} measuring ${Math.min(SECS, el).toFixed(0)}/${SECS}s` + (last ? ` | ${fmtN(last.rate)} keys/sec` : "");
+        }, 100);
+        setTimeout(() => g.stop(), SECS * 1000);
+        await g.run({ onStats: (s) => { last = s; if (performance.now() - t0 > 3000) windows.push(s.rate); }, onError: (err) => line("error: " + (err.message || err), "r") });
+        clearInterval(timer); timer = null;
+        progress.textContent = "";
+        // steady state: median of the windows after the batch size settled
+        windows.sort((a, b) => a - b);
+        const rate = windows.length ? windows[Math.floor(windows.length / 2)] : (last ? last.avg : 0);
+        if (!rate) throw new Error("no measurement");
+        localStorage.setItem(MY_KEY, JSON.stringify({ rate, name: g.gpuName + " (this browser)" }));
+        line(`your device: ${g.gpuName}, WebGPU in this browser`);
+        const d = line(""); d.textContent = "";
+        const sp = document.createElement("span"); sp.className = "you"; sp.textContent = `speed:       ${fmtN(rate)} keys/sec`;
+        d.append(sp);
+        const slot = document.createElement("div"); slot.className = "bars-slot";
+        log.appendChild(slot); renderBars(slot);
+        line("");
+        line("average wait for one address on this device:", "dim");
+        const rowsT = [[3, "abc"], [4, "pump"], [5, "Anton"], [6, "Solana"], [7, "Phantom"], [8, "Solana42"]];
+        for (const [k, ex] of rowsT) line(`  ${k} chars ${("(" + ex + ")").padEnd(11)} ${fmtT(58 ** k / rate).padStart(10)}`, k <= 5 ? "" : "dim");
+        line("  a prefix starting with J…z takes ~17× longer", "dim");
+        line("  ignoring case (-i) is several times faster", "dim");
+        if (rate < 100e6) line("  the native app on an NVIDIA GPU reaches ~410M keys/sec — see [2] download app", "dim");
+        refreshBars();
+    } catch (err) {
+        if (timer) clearInterval(timer);
+        progress.textContent = "";
+        line("bench error: " + (err.message || err), "r");
+    }
+    running = false; startBtn.disabled = !navigator.gpu;
+}
 
 async function runSelftest() {
     if (running) return;

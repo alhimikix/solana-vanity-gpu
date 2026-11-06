@@ -61,7 +61,7 @@ b { font-weight: 700; font-size: 1.15em; }
 
 /* output */
 .log > * { animation: fadein .18s ease; }
-.log > div { white-space: pre-wrap; word-break: break-all; }
+.log > div { white-space: pre-wrap; overflow-wrap: anywhere; }
 .log .found { color: var(--c); }
 .log mark { background: var(--hl); color: #fff; padding: 0 1px; border-radius: 2px; box-shadow: 0 0 12px rgba(35, 134, 54, .55); }
 .log .acts { margin-left: 12px; white-space: nowrap; }
@@ -74,6 +74,14 @@ b { font-weight: 700; font-size: 1.15em; }
 #progress .pb { color: var(--g); }
 #progress .pb0 { color: #1f2630; }
 @keyframes fadein { from { opacity: 0; } to { opacity: 1; } }
+
+.bars .b4 { color: #b07cff; text-shadow: 0 0 10px rgba(153, 69, 255, .55); }
+.you { color: #c9a6ff; font-weight: 700; text-shadow: 0 0 10px rgba(153, 69, 255, .45); }
+.act.big { font: inherit; font-weight: 700; color: #c9a6ff; background: rgba(153, 69, 255, .12); border: 1px solid #5b3d99;
+  border-radius: 5px; padding: 1px 10px; margin: 6px 0; cursor: pointer; }
+.act.big:hover { background: rgba(153, 69, 255, .25); box-shadow: 0 0 14px rgba(153, 69, 255, .35); text-decoration: none; }
+.bars-slot { overflow: hidden; }
+.log pre:not(.bars):not(.logo) { white-space: pre-wrap; overflow-wrap: anywhere; }
 
 /* prompt */
 .prompt { flex: none; display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; padding: 12px 22px 8px;
@@ -96,6 +104,13 @@ b { font-weight: 700; font-size: 1.15em; }
 
 @media (max-width: 760px) {
   body { font-size: 12px; }
+  .prompt { font-size: 13px; gap: 2px 10px; }
+  .prompt input:not([type=checkbox]) { width: 9ch; }
+  .prompt .chk .dim { display: none; }
+  #hint:not(.err) { display: none; }
+  .keys { flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; white-space: nowrap; }
+  .keys::-webkit-scrollbar { display: none; }
+  .keys button, .keys a { flex: none; }
   .term { inset: 0; border-radius: 0; }
   .bar .title { display: none; }
   .keys { padding: 6px 12px 8px; font-size: 12px; gap: 2px 10px; }
