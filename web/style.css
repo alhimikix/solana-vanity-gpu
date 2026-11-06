@@ -109,7 +109,9 @@ b { font-weight: 700; font-size: 1.15em; }
   .bar .title { display: none; }
   .screen { padding: 12px; }
   .prompt { padding: 10px 12px 6px; font-size: 14px; gap: 2px 10px; }
-  .prompt input:not([type=checkbox]) { width: 9ch; }
+  /* iOS zooms into any input with a font smaller than 16px on focus */
+  .prompt input:not([type=checkbox]), .prompt select { font-size: 16px; }
+  .prompt input:not([type=checkbox]) { width: 8ch; }
   .prompt .chk .dim { display: none; }
   #hint:not(.err) { display: none; }
   /* all commands visible as finger-sized keys, kept clear of the home indicator / browser bar */
