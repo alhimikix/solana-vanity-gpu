@@ -6,6 +6,12 @@ starts and/or ends with what you want. Several patterns can be searched at once,
 **~410M keys/sec on an RTX 5080** (the v1.0.0 kernel does 67–70M on the same card). Keys are standard
 32-byte seeds, so they import into Phantom, Solflare and `solana-keygen` as usual.
 
+
+
+https://github.com/user-attachments/assets/e398972d-8331-4d56-8764-61573bc38220
+
+
+
 ## Requirements
 
 - **NVIDIA GPU** with Compute Capability ≥ 7.5 (RTX 20xx and newer).
