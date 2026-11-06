@@ -49,7 +49,7 @@ jobs:
           $version = "${{ github.ref_name }}"
           New-Item -ItemType Directory -Force -Path release-win
           Copy-Item vanity_gpu_sm75.exe, vanity_gpu_sm86.exe, vanity_gpu_sm89.exe, vanity_gpu_sm120.exe release-win/
-          Copy-Item README.md, LICENSE, CHANGELOG.md release-win/
+          Copy-Item README.md, LICENSE, NOTICE, CHANGELOG.md release-win/
           Compress-Archive -Path release-win/* -DestinationPath "solana-vanity-gpu-$version-windows-x64.zip"
 
       - name: Upload artifact
@@ -87,7 +87,7 @@ jobs:
           version="${{ github.ref_name }}"
           mkdir -p release-linux
           cp vanity_gpu_sm75 vanity_gpu_sm86 vanity_gpu_sm89 vanity_gpu_sm120 release-linux/
-          cp README.md LICENSE CHANGELOG.md release-linux/
+          cp README.md LICENSE NOTICE CHANGELOG.md release-linux/
           tar -czf "solana-vanity-gpu-${version}-linux-x64.tar.gz" -C release-linux .
 
       - name: Upload artifact

@@ -1,3 +1,6 @@
+// Copyright 2026 alhimikix — https://github.com/alhimikix/solana-vanity-gpu
+// SPDX-License-Identifier: Apache-2.0 (see LICENSE and NOTICE)
+//
 // GPU Solana vanity address grinder (prefix / suffix / both, multi-pattern, multi-GPU).
 //
 // Pipeline per batch of NK keys:

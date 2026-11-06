@@ -163,7 +163,9 @@ batched inversion → `y` and the sign of `x` → pattern check.
 
 ## License
 
-MIT. See `LICENSE`.
+Apache License 2.0 — see `LICENSE` and `NOTICE`. You can use, modify and sell it, including in closed
+products. If you redistribute it or something based on it, keep the `NOTICE` file (credit to the author)
+and mark the files you changed. Versions up to v1.0.0 were released under MIT.
 
 ## Credits
 

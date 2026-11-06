@@ -39,6 +39,7 @@ for %%A in (75 86 89 120) do (
 
 copy README.md "%OUTDIR%\" >nul
 copy LICENSE "%OUTDIR%\" >nul
+copy NOTICE "%OUTDIR%\" >nul
 copy CHANGELOG.md "%OUTDIR%\" >nul
 copy build.bat "%OUTDIR%\" >nul
 

@@ -20,7 +20,7 @@ for arch in 75 86 89 120; do
     "$NVCC" -O3 -arch="sm_${arch}" -Xcompiler -pthread -o "$OUTDIR/vanity_gpu_sm${arch}" vanity.cu
 done
 
-cp README.md LICENSE CHANGELOG.md build.sh "$OUTDIR/"
+cp README.md LICENSE NOTICE CHANGELOG.md build.sh "$OUTDIR/"
 
 cd release
 tar -czf "solana-vanity-gpu-${VERSION}-linux-x64.tar.gz" -C "solana-vanity-gpu-${VERSION}-linux-x64" .

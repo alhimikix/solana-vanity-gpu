@@ -29,6 +29,9 @@
 - Speed is measured with a wall clock on every platform.
 - Matches beyond the per-batch buffer are counted and reported instead of being lost silently.
 
+### License
+- Apache License 2.0 with a `NOTICE` file (was MIT): redistributions must keep the author credit.
+
 ### Build
 - `build.bat` / `build.sh` build for the local GPU by default (`SM_ARCH` overrides).
 - Release packages add `sm_120` (RTX 50xx); CI uses CUDA 12.9.
